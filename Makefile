@@ -177,6 +177,20 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
+##@ Security
+.PHONY: gosec
+gosec: install-security-scanner ## Run gosec security scan (fails on findings)
+	$(GOSEC) ./...
+
+.PHONY: govulncheck
+govulncheck: install-govulncheck ## Run govulncheck vulnerability scan (fails on findings)
+	$(GOVULNCHECK) ./...
+
+.PHONY: go-security-scan-docker
+go-security-scan-docker: ## Run gosec scan using official container (alternative if local install fails)
+	@echo "Running gosec via Docker container..."; \
+	$(CONTAINER_TOOL) run --rm -v $(PWD):/workspace -w /workspace securego/gosec/gosec:latest ./...
+
 ##@ Dependencies
 
 ## Location to install dependencies to
@@ -191,10 +205,14 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GOSEC ?= $(LOCALBIN)/gosec
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
 CONTROLLER_TOOLS_VERSION ?= v0.22.0
+GOSEC_VERSION ?= latest
+GOVULNCHECK_VERSION ?= latest
 
 #ENVTEST_VERSION is the setup-envtest release branch to install, derived from the
 #controller-runtime version in go.mod. setup-envtest lives in a nested module whose
@@ -241,6 +259,34 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
 		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
 	} || true
+
+.PHONY: install-security-scanner
+install-security-scanner: $(GOSEC) ## Install gosec security scanner locally (static analysis for security issues)
+$(GOSEC): $(LOCALBIN)
+	@set -e; echo "Attempting to install gosec $(GOSEC_VERSION)"; \
+	if ! GOBIN=$(LOCALBIN) go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION) 2>/dev/null; then \
+		echo "Primary install failed, attempting install from @main (compatibility fallback)"; \
+		if ! GOBIN=$(LOCALBIN) go install github.com/securego/gosec/v2/cmd/gosec@main; then \
+			echo "gosec installation failed for versions $(GOSEC_VERSION) and @main"; \
+			exit 1; \
+		fi; \
+	fi; \
+	echo "gosec installed at $(GOSEC)"; \
+	chmod +x $(GOSEC)
+
+.PHONY: install-govulncheck
+install-govulncheck: $(GOVULNCHECK) ## Install govulncheck locally (vulnerability scanner for Go)
+$(GOVULNCHECK): $(LOCALBIN)
+	@set -e; echo "Attempting to install govulncheck $(GOVULNCHECK_VERSION)"; \
+	if ! GOBIN=$(LOCALBIN) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) 2>/dev/null; then \
+		echo "Primary install failed, attempting install from @latest (compatibility fallback)"; \
+		if ! GOBIN=$(LOCALBIN) go install golang.org/x/vuln/cmd/govulncheck@latest; then \
+			echo "govulncheck installation failed for versions $(GOVULNCHECK_VERSION) and @latest"; \
+			exit 1; \
+		fi; \
+	fi; \
+	echo "govulncheck installed at $(GOVULNCHECK)"; \
+	chmod +x $(GOVULNCHECK)
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
