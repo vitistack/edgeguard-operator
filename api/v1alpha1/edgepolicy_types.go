@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -75,11 +76,42 @@ type AllowedRegionSpec struct {
 	AdditionalAllowList []string `json:"additionalAllowList,omitempty"`
 }
 
+// ObservedPort describes a port discovered on the target Service.
+type ObservedPort struct {
+	// Name is the name of the Service port, if one is set.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name,omitempty"`
+
+	// Port is the port number exposed by the Service.
+	// +required
+	Port int32 `json:"port"`
+
+	// Protocol is the IP protocol for this port (TCP, UDP, or SCTP).
+	// +optional
+	// +kubebuilder:validation:Enum=TCP;UDP;SCTP
+	Protocol corev1.Protocol `json:"protocol,omitempty"`
+}
+
 // EdgePolicyStatus defines the observed state of EdgePolicy.
 type EdgePolicyStatus struct {
 	// ObservedGeneration is the most recent generation observed by the controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// ObservedPorts lists the ports discovered on the target Service.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=256
+	ObservedPorts []ObservedPort `json:"observedPorts,omitempty"`
+
+	// ObservedIPs lists the load balancer ingress IP addresses discovered on the
+	// target Service.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MaxLength=45
+	ObservedIPs []string `json:"observedIPs,omitempty"`
 
 	// Conditions represent the current status of the edge policy.
 	// +optional
@@ -91,6 +123,11 @@ type EdgePolicyStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=epol
+// +kubebuilder:printcolumn:name="Target",type=string,JSONPath=".spec.targetRef.name"
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=".status.conditions[?(@.type=='Ready')].reason",priority=1
+// +kubebuilder:printcolumn:name="Secret",type=string,JSONPath=".status.conditions[?(@.type=='IpamSecretReady')].reason",priority=1
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // EdgePolicy is the Schema for the edgepolicies API
 type EdgePolicy struct {

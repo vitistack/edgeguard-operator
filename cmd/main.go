@@ -37,6 +37,7 @@ import (
 
 	securityv1alpha1 "github.com/vitistack/edgeguard-operator/api/v1alpha1"
 	"github.com/vitistack/edgeguard-operator/internal/controller"
+	"github.com/vitistack/edgeguard-operator/internal/upstream"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -62,6 +63,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var upstreamURL string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -82,6 +84,9 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&upstreamURL, "upstream-url", os.Getenv("UPSTREAM_API_URL"),
+		"Base URL of the external API that receives port-discovery reports. "+
+			"Leave empty to disable upstream reporting. The bearer token is read from UPSTREAM_API_TOKEN.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -182,9 +187,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Select the upstream reporter. Defaults to a no-op so the operator runs
+	// without an external dependency; an HTTP reporter is used when a URL is set.
+	var reporter upstream.Reporter = upstream.NoopReporter{}
+	if upstreamURL != "" {
+		reporter = upstream.NewHTTPReporter(upstreamURL, os.Getenv("UPSTREAM_API_TOKEN"))
+		setupLog.Info("Upstream port reporting enabled", "upstream-url", upstreamURL)
+	}
+
 	if err := (&controller.EdgePolicyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Reporter: reporter,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "edgepolicy")
 		os.Exit(1)

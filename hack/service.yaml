@@ -5,8 +5,11 @@ metadata:
   namespace: default
   labels:
     app: my-app
+  annotations:
+    ipam.vitistack.io/secret: default
+    ipam.vitistack.io/zone: inet
 spec:
-  type: ClusterIP
+  type: LoadBalancer
   selector:
     app: my-app
   ports:
@@ -14,3 +17,7 @@ spec:
       protocol: TCP
       port: 80
       targetPort: 8080
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 8443

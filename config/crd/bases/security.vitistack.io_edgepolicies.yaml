@@ -16,7 +16,25 @@ spec:
     singular: edgepolicy
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.targetRef.name
+      name: Target
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Ready')].reason
+      name: Reason
+      priority: 1
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='IpamSecretReady')].reason
+      name: Secret
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: EdgePolicy is the Schema for the edgepolicies API
@@ -170,6 +188,46 @@ spec:
                   by the controller.
                 format: int64
                 type: integer
+              observedIPs:
+                description: |-
+                  ObservedIPs lists the load balancer ingress IP addresses discovered on the
+                  target Service.
+                items:
+                  maxLength: 45
+                  type: string
+                maxItems: 256
+                type: array
+                x-kubernetes-list-type: atomic
+              observedPorts:
+                description: ObservedPorts lists the ports discovered on the target
+                  Service.
+                items:
+                  description: ObservedPort describes a port discovered on the target
+                    Service.
+                  properties:
+                    name:
+                      description: Name is the name of the Service port, if one is
+                        set.
+                      maxLength: 63
+                      type: string
+                    port:
+                      description: Port is the port number exposed by the Service.
+                      format: int32
+                      type: integer
+                    protocol:
+                      description: Protocol is the IP protocol for this port (TCP,
+                        UDP, or SCTP).
+                      enum:
+                      - TCP
+                      - UDP
+                      - SCTP
+                      type: string
+                  required:
+                  - port
+                  type: object
+                maxItems: 256
+                type: array
+                x-kubernetes-list-type: atomic
             type: object
         required:
         - spec
