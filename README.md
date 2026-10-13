@@ -41,7 +41,7 @@ flowchart LR
     SVC --> OP
     SEC --> OP
     OP -- finalizer + status --> EP
-    OP -- "POST/DELETE /v1/port-reports (if filter.enable=true)" --> UP[(Upstream IPAM API<br/>vitistack/ipam-operator)]
+    OP -- "POST/DELETE  (if filter.enable=true)" --> UP[(Upstream IPAM API<br/>vitistack/ipam-operator)]
 ```
 
 1. An `EdgePolicy` references a `Service` by name via `spec.targetRef`.
@@ -180,8 +180,8 @@ The manager is configured with environment variables (each also has an equivalen
 When reporting is enabled and ports/IPs change, the operator sends a report; when the policy or its target Service is removed, it withdraws it:
 
 ```
-POST   <UPSTREAM_API_URL>/v1/port-reports     # add / update
-DELETE <UPSTREAM_API_URL>/v1/port-reports     # withdraw on removal
+POST   <UPSTREAM_API_URL>     # add / update
+DELETE <UPSTREAM_API_URL>     # withdraw on removal
 Content-Type: application/json
 Idempotency-Key: <sha256 hash>
 ```
