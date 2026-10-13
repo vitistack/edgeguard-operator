@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -52,6 +53,12 @@ const serviceFinalizer = "security.vitistack.io/edgepolicy-protection"
 // reconcile where we can release the finalizer held on the target Service.
 const edgePolicyFinalizer = "security.vitistack.io/edgepolicy-finalizer"
 
+// upstreamRetryInterval is how long to wait before retrying after a transient
+// upstream report failure (DNS, connectivity, 5xx). Such failures are logged
+// softly and requeued rather than surfaced as a hard reconcile error with a
+// stack trace, since they are expected and self-healing.
+const upstreamRetryInterval = 30 * time.Second
+
 // Condition types and reasons reported on the EdgePolicy status.
 const (
 	// conditionTypeReady summarizes whether the policy's target Service is protected.
@@ -70,6 +77,14 @@ const (
 	reasonSecretNotFound      = "SecretNotFound"
 	reasonSecretInvalid       = "SecretInvalid"
 	reasonSecretNotConfigured = "SecretNotConfigured"
+
+	// conditionTypeUpstreamReady reports whether upstream port reporting is
+	// configured (i.e. a BaseURL is set from UPSTREAM_API_URL). It is only
+	// evaluated for policies that enable ACL reporting.
+	conditionTypeUpstreamReady = "UpstreamReady"
+
+	reasonUpstreamNotConfigured = "UpstreamNotConfigured"
+	reasonUpstreamReportFailed  = "UpstreamReportFailed"
 )
 
 // zoneAnnotation, when present on the target Service, carries the IPAM zone reported upstream.
@@ -104,7 +119,7 @@ type EdgePolicyReconciler struct {
 // +kubebuilder:rbac:groups=security.vitistack.io,resources=edgepolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -222,14 +237,19 @@ func (r *EdgePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		log.Info("Added finalizer to Service", "service", service.Name)
 	}
 
-	return ctrl.Result{}, r.reconcileProtectedService(ctx, &policy, service)
+	return r.reconcileProtectedService(ctx, &policy, service)
 }
 
 // reconcileProtectedService records the discovered ports and IPs of a protected
 // LoadBalancer Service on the policy status, reports them upstream when ACL is
 // enabled, and persists the status only when something actually changed.
+//
+// A transient upstream report failure is treated as soft: it is logged at Info
+// level and requeued after upstreamRetryInterval rather than returned as an error,
+// so the controller does not emit a noisy ERROR with a stack trace for an expected,
+// self-healing condition.
 func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
-	policy *securityv1alpha1.EdgePolicy, service *corev1.Service) error {
+	policy *securityv1alpha1.EdgePolicy, service *corev1.Service) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// Reflect that the target Service is now protected by this policy.
@@ -241,17 +261,25 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 	// not-found condition but reconciliation continues with an empty credential.
 	var ipamSecret string
 	secretChanged := false
+	upstreamChanged := false
+	upstreamConfigured := false
 	if aclEnabled(policy) {
 		value, state, err := r.resolveIpamSecret(ctx, service)
 		if err != nil {
 			log.Error(err, "Failed to resolve IPAM secret", "service", service.Name)
-			return err
+			return ctrl.Result{}, err
 		}
 		ipamSecret = value
 		secretChanged = setIpamSecretCondition(policy, service, state)
+
+		// Surface whether an upstream endpoint is configured so a missing
+		// UPSTREAM_API_URL is visible on the status rather than silently dropped.
+		upstreamConfigured = reporterConfigured(r.Reporter)
+		upstreamChanged = setUpstreamConfiguredCondition(policy, upstreamConfigured)
 	} else {
-		// No reporting configured; drop any stale secret condition.
+		// No reporting configured; drop any stale secret / upstream conditions.
 		secretChanged = meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeIpamSecretReady)
+		upstreamChanged = meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeUpstreamReady)
 	}
 
 	// Record the discovered Service ports and load balancer IPs. Report them
@@ -262,17 +290,29 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 	portsChanged := !observedPortsEqual(policy.Status.ObservedPorts, desiredPorts)
 	ipsChanged := !stringSlicesEqual(policy.Status.ObservedIPs, desiredIPs)
 	if portsChanged || ipsChanged {
-		if aclEnabled(policy) {
+		if aclEnabled(policy) && upstreamConfigured {
 			if err := r.reportPortsUpstream(ctx, policy, service, ipamSecret, desiredPorts, desiredIPs); err != nil {
-				log.Error(err, "Failed to report discovered ports upstream", "service", service.Name)
-				return err
+				// Transient upstream failures (DNS, connectivity, 5xx) are expected and
+				// self-healing. Log softly, surface the failure on the status so it is
+				// visible via kubectl, and requeue instead of returning a hard error
+				// (which logs an ERROR with a stack trace). ObservedPorts is left
+				// unwritten so the retry re-reports.
+				log.Info("Could not report discovered ports upstream; will retry",
+					"service", service.Name, "retryAfter", upstreamRetryInterval.String(), "error", err.Error())
+				failedChanged := setUpstreamReportFailedCondition(policy, err)
+				changed := condChanged || secretChanged || upstreamChanged || failedChanged
+				if werr := r.writeStatus(ctx, policy, changed); werr != nil {
+					return ctrl.Result{}, werr
+				}
+				return ctrl.Result{RequeueAfter: upstreamRetryInterval}, nil
 			}
 		}
 		policy.Status.ObservedPorts = desiredPorts
 		policy.Status.ObservedIPs = desiredIPs
 	}
 
-	return r.writeStatus(ctx, policy, condChanged || secretChanged || portsChanged || ipsChanged)
+	return ctrl.Result{}, r.writeStatus(ctx, policy,
+		condChanged || secretChanged || upstreamChanged || portsChanged || ipsChanged)
 }
 
 // setReadyCondition mutates the Ready condition and ObservedGeneration on the policy
@@ -334,23 +374,20 @@ func (r *EdgePolicyReconciler) reportPortsUpstream(ctx context.Context, policy *
 		return nil
 	}
 
-	clusterUID, err := r.clusterUID(ctx)
+	clusterID, err := r.clusterUID(ctx)
 	if err != nil {
-		return fmt.Errorf("resolving cluster UID: %w", err)
+		return fmt.Errorf("resolving cluster ID: %w", err)
 	}
 
 	ipv4, ipv6 := splitIPFamilies(ips)
 	report := upstream.PortReport{
-		ClusterUID:       clusterUID,
-		PolicyNamespace:  policy.Namespace,
-		PolicyName:       policy.Name,
-		PolicyUID:        string(policy.UID),
-		ServiceName:      service.Name,
-		IpamZone:         service.Annotations[zoneAnnotation],
-		IpamSecret:       ipamSecret,
-		LoadBalancerIPv4: ipv4,
-		LoadBalancerIPv6: ipv6,
-		Ports:            make([]upstream.Port, 0, len(ports)),
+		ClusterID:     clusterID,
+		ServiceName:   service.Name,
+		IpamZone:      service.Annotations[zoneAnnotation],
+		IpamSecret:    ipamSecret,
+		IPv4Addresses: ipv4,
+		IPv6Addresses: ipv6,
+		Ports:         make([]upstream.Port, 0, len(ports)),
 	}
 	for _, p := range ports {
 		report.Ports = append(report.Ports, upstream.Port{
@@ -362,8 +399,14 @@ func (r *EdgePolicyReconciler) reportPortsUpstream(ctx context.Context, policy *
 	if err := r.Reporter.ReportPorts(ctx, report); err != nil {
 		return err
 	}
-	logf.FromContext(ctx).Info("Reported discovered ports upstream",
-		"edgepolicy", policy.Name, "service", service.Name, "ports", len(ports), "ips", len(ips))
+	log := logf.FromContext(ctx)
+	if reportingDisabled(r.Reporter) {
+		log.Info("Skipped upstream report (reporting disabled)",
+			"edgepolicy", policy.Name, "service", service.Name, "ports", len(ports), "ips", len(ips))
+	} else {
+		log.Info("Reported discovered ports upstream",
+			"edgepolicy", policy.Name, "service", service.Name, "ports", len(ports), "ips", len(ips))
+	}
 	return nil
 }
 
@@ -464,6 +507,59 @@ func setIpamSecretCondition(policy *securityv1alpha1.EdgePolicy, service *corev1
 		Status:             status,
 		Reason:             reason,
 		Message:            message,
+		ObservedGeneration: policy.Generation,
+	})
+}
+
+// reporterConfigured reports whether the configured Reporter can actually deliver
+// reports. A nil Reporter is treated as not configured. Reporters that advertise a
+// Configured() method (the HTTP reporter) are asked directly; any other Reporter
+// (e.g. a test fake) is assumed ready.
+func reporterConfigured(r upstream.Reporter) bool {
+	if r == nil {
+		return false
+	}
+	if c, ok := r.(interface{ Configured() bool }); ok {
+		return c.Configured()
+	}
+	return true
+}
+
+// reportingDisabled reports whether the configured Reporter is a disabled/no-op
+// sink that accepts reports without actually delivering them, so the caller can
+// log accordingly instead of claiming a real upstream delivery.
+func reportingDisabled(r upstream.Reporter) bool {
+	d, ok := r.(interface{ Disabled() bool })
+	return ok && d.Disabled()
+}
+
+// setUpstreamConfiguredCondition surfaces whether upstream reporting is configured.
+// When configured, any stale UpstreamReady condition is removed to keep the status
+// clean; when not, a False/UpstreamNotConfigured condition is set so the missing
+// UPSTREAM_API_URL is visible. It returns whether the status changed.
+func setUpstreamConfiguredCondition(policy *securityv1alpha1.EdgePolicy, configured bool) bool {
+	if configured {
+		return meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeUpstreamReady)
+	}
+	return meta.SetStatusCondition(&policy.Status.Conditions, metav1.Condition{
+		Type:               conditionTypeUpstreamReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonUpstreamNotConfigured,
+		Message:            "No upstream API URL configured (set UPSTREAM_API_URL)",
+		ObservedGeneration: policy.Generation,
+	})
+}
+
+// setUpstreamReportFailedCondition marks UpstreamReady as False/UpstreamReportFailed
+// while a transient upstream delivery failure is being retried, so the failure is
+// visible on the status. It returns whether the status changed. A later successful
+// reconcile clears the condition via setUpstreamConfiguredCondition.
+func setUpstreamReportFailedCondition(policy *securityv1alpha1.EdgePolicy, reportErr error) bool {
+	return meta.SetStatusCondition(&policy.Status.Conditions, metav1.Condition{
+		Type:               conditionTypeUpstreamReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonUpstreamReportFailed,
+		Message:            fmt.Sprintf("Failed to report ports upstream: %v", reportErr),
 		ObservedGeneration: policy.Generation,
 	})
 }

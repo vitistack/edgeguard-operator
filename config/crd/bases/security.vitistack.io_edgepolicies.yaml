@@ -31,6 +31,10 @@ spec:
       name: Secret
       priority: 1
       type: string
+    - jsonPath: .status.conditions[?(@.type=='UpstreamReady')].reason
+      name: Upstream
+      priority: 1
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date

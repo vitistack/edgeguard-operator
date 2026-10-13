@@ -27,25 +27,22 @@ const (
 // baseReport is a representative report used across the idempotency-key tests.
 func baseReport() PortReport {
 	return PortReport{
-		PolicyUID:        "uid-1",
-		Ports:            []Port{{Name: portHTTP, Port: 80, Protocol: protoTCP}},
-		LoadBalancerIPv4: []string{"203.0.113.10"},
-		LoadBalancerIPv6: []string{"2001:db8::10"},
+		ServiceName:   "my-service",
+		Ports:         []Port{{Name: portHTTP, Port: 80, Protocol: protoTCP}},
+		IPv4Addresses: []string{"203.0.113.10"},
+		IPv6Addresses: []string{"2001:db8::10"},
 	}
 }
 
 func TestIdempotencyKeyIgnoresNonDedupeFields(t *testing.T) {
 	base := baseReport()
 
-	// Same policy/ports/IPs but a rotated credential, different zone, cluster UID,
-	// and policy name must not change the key.
+	// Same service/ports/IPs but a rotated credential, different zone, and cluster
+	// ID must not change the key.
 	other := baseReport()
 	other.IpamSecret = "rotated"
 	other.IpamZone = "oslo-2"
-	other.ClusterUID = "a-different-cluster"
-	other.PolicyName = "renamed"
-	other.PolicyNamespace = "elsewhere"
-	other.ServiceName = "renamed-svc"
+	other.ClusterID = "a-different-cluster"
 
 	if base.IdempotencyKey() != other.IdempotencyKey() {
 		t.Fatalf("expected equal keys when only non-dedupe fields differ:\n base=%s\n other=%s",
@@ -58,14 +55,14 @@ func TestIdempotencyKeyChangesWithDedupeFields(t *testing.T) {
 	baseKey := base.IdempotencyKey()
 
 	cases := map[string]func(*PortReport){
-		"policy UID": func(r *PortReport) { r.PolicyUID = "uid-2" },
+		"service name": func(r *PortReport) { r.ServiceName = "other-service" },
 		"port added": func(r *PortReport) {
 			r.Ports = append(r.Ports, Port{Name: "https", Port: 443, Protocol: protoTCP})
 		},
 		"port number": func(r *PortReport) { r.Ports = []Port{{Name: portHTTP, Port: 8080, Protocol: protoTCP}} },
 		"protocol":    func(r *PortReport) { r.Ports = []Port{{Name: portHTTP, Port: 80, Protocol: "UDP"}} },
-		"ipv4":        func(r *PortReport) { r.LoadBalancerIPv4 = []string{"203.0.113.11"} },
-		"ipv6":        func(r *PortReport) { r.LoadBalancerIPv6 = nil },
+		"ipv4":        func(r *PortReport) { r.IPv4Addresses = []string{"203.0.113.11"} },
+		"ipv6":        func(r *PortReport) { r.IPv6Addresses = nil },
 	}
 
 	for name, mutate := range cases {

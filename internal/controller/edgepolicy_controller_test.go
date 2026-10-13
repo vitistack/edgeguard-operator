@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -307,12 +308,11 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(reporter.reports).To(HaveLen(1))
 			report := reporter.reports[0]
 			Expect(report.ServiceName).To(Equal(serviceName))
-			Expect(report.PolicyName).To(Equal(policyName))
 			Expect(report.IpamZone).To(Equal("oslo-1"))
 			Expect(report.IpamSecret).To(Equal("s3cr3t"))
-			Expect(report.ClusterUID).NotTo(BeEmpty())
-			Expect(report.LoadBalancerIPv4).To(ConsistOf("203.0.113.10"))
-			Expect(report.LoadBalancerIPv6).To(ConsistOf("2001:db8::10"))
+			Expect(report.ClusterID).NotTo(BeEmpty())
+			Expect(report.IPv4Addresses).To(ConsistOf("203.0.113.10"))
+			Expect(report.IPv6Addresses).To(ConsistOf("2001:db8::10"))
 			Expect(report.Ports).To(HaveLen(1))
 			Expect(report.Ports[0].Port).To(Equal(int32(443)))
 
@@ -331,6 +331,176 @@ var _ = Describe("EdgePolicy Controller", func() {
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(reporter.reports).To(HaveLen(1))
+		})
+	})
+
+	Context("When the upstream URL is not configured", func() {
+		const (
+			policyName  = "no-upstream-policy"
+			namespace   = "default"
+			serviceName = "no-upstream-service"
+		)
+
+		ctx := context.Background()
+		policyKey := types.NamespacedName{Name: policyName, Namespace: namespace}
+		serviceKey := types.NamespacedName{Name: serviceName, Namespace: namespace}
+
+		It("reports UpstreamReady=False and does not attempt a report", func() {
+			By("using an HTTP reporter with no BaseURL, so it is not configured")
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: upstream.NewHTTPReporter(""),
+			}
+
+			By("creating an EdgePolicy with acl enabled and its LoadBalancer Service")
+			aclOn := true
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      policyName,
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       serviceName,
+					},
+					ACL: &aclOn,
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &securityv1alpha1.EdgePolicy{}
+				if err := k8sClient.Get(ctx, policyKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			service := &corev1.Service{
+				Name:      serviceName,
+				Namespace: namespace,
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.20"}}
+			Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, serviceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("reconciling: first adds the finalizer, second protects the Service")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("confirming the status surfaces the missing upstream configuration")
+			reconciled := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, reconciled)).To(Succeed())
+			cond := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(reasonUpstreamNotConfigured))
+
+			By("confirming discovery still recorded the observed ports and IPs")
+			Expect(reconciled.Status.ObservedIPs).To(ConsistOf("203.0.113.20"))
+			Expect(reconciled.Status.ObservedPorts).To(HaveLen(1))
+		})
+	})
+
+	Context("When an upstream report fails transiently", func() {
+		const (
+			policyName  = "report-fail-policy"
+			namespace   = "default"
+			serviceName = "report-fail-service"
+		)
+
+		ctx := context.Background()
+		policyKey := types.NamespacedName{Name: policyName, Namespace: namespace}
+		serviceKey := types.NamespacedName{Name: serviceName, Namespace: namespace}
+
+		It("surfaces UpstreamReportFailed, requeues, and does not record observed ports", func() {
+			By("using a reporter that always fails, as a transient upstream outage would")
+			reporter := &fakeReporter{err: fmt.Errorf("dial tcp: lookup ipam-api: no such host")}
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: reporter,
+			}
+
+			By("creating an EdgePolicy with acl enabled and its LoadBalancer Service")
+			aclOn := true
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      policyName,
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       serviceName,
+					},
+					ACL: &aclOn,
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &securityv1alpha1.EdgePolicy{}
+				if err := k8sClient.Get(ctx, policyKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			service := &corev1.Service{
+				Name:      serviceName,
+				Namespace: namespace,
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.30"}}
+			Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, serviceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("reconciling: first adds the finalizer, second attempts the failing report")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+
+			By("confirming the failure is soft: no error returned, requeued for retry")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(upstreamRetryInterval))
+
+			By("confirming the failure is surfaced on the status")
+			reconciled := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, reconciled)).To(Succeed())
+			cond := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(reasonUpstreamReportFailed))
+
+			By("confirming observed ports were not recorded, so the retry re-reports")
+			Expect(reconciled.Status.ObservedPorts).To(BeEmpty())
+			Expect(reconciled.Status.ObservedIPs).To(BeEmpty())
 		})
 	})
 

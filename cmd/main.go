@@ -20,15 +20,18 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strconv"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -53,6 +56,14 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+// envBool reads a boolean environment variable, accepting the forms understood by
+// strconv.ParseBool (1, t, T, TRUE, true, ...). An unset or unparseable value is
+// treated as false.
+func envBool(name string) bool {
+	v, err := strconv.ParseBool(os.Getenv(name))
+	return err == nil && v
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
@@ -64,6 +75,7 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var upstreamURL string
+	var disableUpstreamReporting bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -86,7 +98,11 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.StringVar(&upstreamURL, "upstream-url", os.Getenv("UPSTREAM_API_URL"),
 		"Base URL of the external API that receives port-discovery reports. "+
-			"Leave empty to disable upstream reporting. The bearer token is read from UPSTREAM_API_TOKEN.")
+			"Defaults to the UPSTREAM_API_URL environment variable; leave empty to disable upstream reporting.")
+	flag.BoolVar(&disableUpstreamReporting, "disable-upstream-reporting", envBool("UPSTREAM_REPORTING_DISABLED"),
+		"If set, upstream reporting is disabled and every report is treated as successfully delivered "+
+			"(no upstream call, no UpstreamReady=False condition). Defaults to the UPSTREAM_REPORTING_DISABLED "+
+			"environment variable. Takes precedence over --upstream-url.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -170,6 +186,16 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "65a4311c.vitistack.io",
+		// Read Secrets directly from the API server instead of through the
+		// shared informer cache. The controller only ever Gets a single named
+		// Secret per reconcile, so caching every Secret cluster-wide is wasteful
+		// and would require list/watch RBAC on secrets; an uncached Get needs
+		// only get.
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{&corev1.Secret{}},
+			},
+		},
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -187,12 +213,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Select the upstream reporter. Defaults to a no-op so the operator runs
-	// without an external dependency; an HTTP reporter is used when a URL is set.
-	var reporter upstream.Reporter = upstream.NoopReporter{}
-	if upstreamURL != "" {
-		reporter = upstream.NewHTTPReporter(upstreamURL, os.Getenv("UPSTREAM_API_TOKEN"))
-		setupLog.Info("Upstream port reporting enabled", "upstream-url", upstreamURL)
+	// Select the upstream reporter. When reporting is explicitly disabled, use a
+	// no-op reporter that reports success so the controller behaves as if every
+	// report was delivered. Otherwise the reporter reads its base URL from
+	// UPSTREAM_API_URL (via --upstream-url); when that is empty the reporter is
+	// left unconfigured and the controller surfaces an UpstreamReady=False
+	// condition on affected policies instead of silently dropping reports.
+	var reporter upstream.Reporter
+	switch {
+	case disableUpstreamReporting:
+		reporter = upstream.NoopReporter{}
+		setupLog.Info("Upstream port reporting disabled; reports are treated as successfully delivered")
+	default:
+		reporter = upstream.NewHTTPReporter(upstreamURL)
+		if upstreamURL != "" {
+			setupLog.Info("Upstream port reporting enabled", "upstream-url", upstreamURL)
+		} else {
+			setupLog.Info("Upstream port reporting not configured (UPSTREAM_API_URL is empty)")
+		}
 	}
 
 	if err := (&controller.EdgePolicyReconciler{

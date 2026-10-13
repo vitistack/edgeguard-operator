@@ -40,14 +40,9 @@ type Port struct {
 
 // PortReport is the payload describing an EdgePolicy's currently discovered ports.
 type PortReport struct {
-	// ClusterUID is the UID of the kube-system namespace, used as a stable
+	// ClusterID is the UID of the kube-system namespace, used as a stable
 	// cluster identifier.
-	ClusterUID string `json:"clusterUID,omitempty"`
-	// PolicyNamespace and PolicyName identify the EdgePolicy that owns the report.
-	PolicyNamespace string `json:"policyNamespace"`
-	PolicyName      string `json:"policyName"`
-	// PolicyUID uniquely identifies the policy instance across recreations.
-	PolicyUID string `json:"policyUID,omitempty"`
+	ClusterID string `json:"clusterID,omitempty"`
 	// ServiceName is the target Service the ports were discovered on.
 	ServiceName string `json:"serviceName"`
 	// IpamZone is the value of the ipam.vitistack.io/zone annotation on the target
@@ -56,24 +51,24 @@ type PortReport struct {
 	// IpamSecret is the credential resolved from the Secret named by the target
 	// Service's ipam.vitistack.io/secret annotation, when present.
 	IpamSecret string `json:"ipamSecret,omitempty"`
-	// LoadBalancerIPv4 and LoadBalancerIPv6 are the load balancer ingress
-	// addresses assigned to the target Service, split by IP family.
-	LoadBalancerIPv4 []string `json:"loadBalancerIPv4,omitempty"`
-	LoadBalancerIPv6 []string `json:"loadBalancerIPv6,omitempty"`
+	// IPv4Addresses and IPv6Addresses are the load balancer ingress addresses
+	// assigned to the target Service, split by IP family.
+	IPv4Addresses []string `json:"ipv4Addresses,omitempty"`
+	IPv6Addresses []string `json:"ipv6Addresses,omitempty"`
 	// Ports is the full, current set of discovered ports (not a delta).
 	Ports []Port `json:"ports"`
 }
 
 // IdempotencyKey returns a stable identifier for the dedupe-relevant content of
-// the report: the owning policy plus its discovered ports and load balancer IPs.
-// Two reports with the same policy, ports, and IPs produce the same key, so an
+// the report: the target Service plus its discovered ports and load balancer IPs.
+// Two reports with the same service, ports, and IPs produce the same key, so an
 // upstream can treat a retry — or a duplicate caused by a reconcile conflict — as
 // the same request and ignore it. Fields that do not change the meaning of the
-// report (credential, zone, cluster UID) are deliberately excluded, so rotating a
+// report (credential, zone, cluster ID) are deliberately excluded, so rotating a
 // credential alone does not defeat deduplication.
 func (r PortReport) IdempotencyKey() string {
 	var b strings.Builder
-	b.WriteString(r.PolicyUID)
+	b.WriteString(r.ServiceName)
 	// Separate sections with a byte that cannot appear in the values above so
 	// distinct inputs cannot collide by concatenation.
 	b.WriteByte('\n')
@@ -86,11 +81,11 @@ func (r PortReport) IdempotencyKey() string {
 		b.WriteByte('\n')
 	}
 	b.WriteByte('\n')
-	for _, ip := range r.LoadBalancerIPv4 {
+	for _, ip := range r.IPv4Addresses {
 		b.WriteString(ip)
 		b.WriteByte('\n')
 	}
-	for _, ip := range r.LoadBalancerIPv6 {
+	for _, ip := range r.IPv6Addresses {
 		b.WriteString(ip)
 		b.WriteByte('\n')
 	}
@@ -108,13 +103,21 @@ type Reporter interface {
 	ReportPorts(ctx context.Context, report PortReport) error
 }
 
-// NoopReporter is a Reporter that discards every report. It is the default when
-// no upstream endpoint is configured, which keeps the controller usable without
-// an external dependency.
+// NoopReporter is a Reporter that discards every report and reports success. It
+// backs the "reporting disabled" mode: the operator behaves as if every report
+// was delivered, without contacting any upstream or surfacing a failure.
 type NoopReporter struct{}
 
 // ReportPorts implements Reporter and does nothing.
 func (NoopReporter) ReportPorts(context.Context, PortReport) error { return nil }
+
+// Configured reports true so the controller treats disabled reporting as healthy
+// (no UpstreamReady=False condition) rather than as a missing configuration.
+func (NoopReporter) Configured() bool { return true }
+
+// Disabled reports true so the controller can log that reports were accepted
+// without being delivered, instead of claiming a real upstream delivery.
+func (NoopReporter) Disabled() bool { return true }
 
 // Ensure NoopReporter satisfies the interface at compile time.
 var _ Reporter = NoopReporter{}

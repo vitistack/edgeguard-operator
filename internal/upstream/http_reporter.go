@@ -33,28 +33,34 @@ const defaultTimeout = 10 * time.Second
 //
 // TODO(user): Adjust this to the real upstream contract:
 //   - Confirm the request path and method the upstream API expects.
-//   - Replace the bearer-token auth below if the API uses mTLS, HMAC, or another scheme.
+//   - Add authentication (mTLS, HMAC, ...) if the API requires it.
 //   - Map the response body / status codes to retryable vs. terminal errors.
 //   - Add tracing / metrics as needed.
 type HTTPReporter struct {
 	// BaseURL is the root URL of the upstream API, e.g. "https://ipam-api.vitistack.io/v2".
+	// It is sourced from the UPSTREAM_API_URL environment variable; an empty value
+	// means upstream reporting is not configured.
 	BaseURL string
-	// Token, when set, is sent as an "Authorization: Bearer <token>" header.
-	Token string
 	// Client is the HTTP client used for requests. If nil, a client with
 	// defaultTimeout is used.
 	Client *http.Client
 }
 
 // NewHTTPReporter builds an HTTPReporter for the given base URL. A zero-value
-// baseURL yields a reporter whose ReportPorts always errors, which callers
-// should treat as a misconfiguration.
-func NewHTTPReporter(baseURL, token string) *HTTPReporter {
+// baseURL yields a reporter that is not Configured and whose ReportPorts always
+// errors, which callers should treat as a misconfiguration.
+func NewHTTPReporter(baseURL string) *HTTPReporter {
 	return &HTTPReporter{
 		BaseURL: baseURL,
-		Token:   token,
 		Client:  &http.Client{Timeout: defaultTimeout},
 	}
+}
+
+// Configured reports whether the reporter has a BaseURL and can deliver reports.
+// The controller uses this to surface an upstream-not-configured status instead
+// of attempting a report that is guaranteed to fail.
+func (h *HTTPReporter) Configured() bool {
+	return h.BaseURL != ""
 }
 
 // ReportPorts implements Reporter by POSTing the report as JSON to
@@ -83,9 +89,6 @@ func (h *HTTPReporter) ReportPorts(ctx context.Context, report PortReport) error
 	// report re-sent after a reconcile conflict): identical policy/ports/IPs yield
 	// the same key. TODO(user): confirm the header name the upstream expects.
 	req.Header.Set("Idempotency-Key", report.IdempotencyKey())
-	if h.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+h.Token)
-	}
 
 	client := h.Client
 	if client == nil {
