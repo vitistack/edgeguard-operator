@@ -3,7 +3,16 @@ kind: EdgePolicy
 metadata:
   name: my-edge-policy
 spec:
-  acl: true
+  datacenter: no-east-az1
+  filter:
+    enable: true
+    additionalPortList:
+      - name: ping
+        port: 0
+        protocol: ICMP
+      - name: custom-app
+        port: 8100
+        protocol: TCP
   allowedRegion:
     region: nordics
     additionalAllowList:

@@ -37,6 +37,12 @@ import (
 // kindService is the only supported TargetRef kind, reused across test fixtures.
 const kindService = "Service"
 
+// Service names reused across the datacenter/delete fixtures (goconst).
+const (
+	dcServiceName     = "dc-service"
+	deleteServiceName = "delete-service"
+)
+
 var _ = Describe("EdgePolicy Controller", func() {
 	Context("When reconciling a resource", func() {
 		const (
@@ -230,7 +236,6 @@ var _ = Describe("EdgePolicy Controller", func() {
 			}
 
 			By("creating an EdgePolicy with acl enabled and its target Service")
-			aclOn := true
 			policy := &securityv1alpha1.EdgePolicy{
 				Name:      policyName,
 				Namespace: namespace,
@@ -240,7 +245,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					ACL: &aclOn,
+					Filter: &securityv1alpha1.FilterSpec{Enable: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -313,8 +318,8 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(report.ClusterID).NotTo(BeEmpty())
 			Expect(report.IPv4Addresses).To(ConsistOf("203.0.113.10"))
 			Expect(report.IPv6Addresses).To(ConsistOf("2001:db8::10"))
-			Expect(report.Ports).To(HaveLen(1))
-			Expect(report.Ports[0].Port).To(Equal(int32(443)))
+			Expect(report.ObservedPorts).To(HaveLen(1))
+			Expect(report.ObservedPorts[0].Port).To(Equal(int32(443)))
 
 			By("confirming the observed IPs were recorded on the policy status")
 			reconciled := &securityv1alpha1.EdgePolicy{}
@@ -331,6 +336,151 @@ var _ = Describe("EdgePolicy Controller", func() {
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(reporter.reports).To(HaveLen(1))
+		})
+
+		It("includes the datacenter and additional ports in the upstream report", func() {
+			reporter := &fakeReporter{}
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: reporter,
+			}
+
+			By("creating a filter-enabled EdgePolicy with datacenter and additionalPortList")
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      "dc-policy",
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       dcServiceName,
+					},
+					Datacenter: "no-east-az1",
+					Filter: &securityv1alpha1.FilterSpec{
+						Enable: true,
+						AdditionalPortList: []securityv1alpha1.AdditionalPort{
+							{Name: "ping", Port: 0, Protocol: "ICMP"},
+							{Name: " h", Port: 8080, Protocol: "TCP"},
+						},
+					},
+				},
+			}
+			dcPolicyKey := types.NamespacedName{Name: "dc-policy", Namespace: namespace}
+			dcServiceKey := types.NamespacedName{Name: dcServiceName, Namespace: namespace}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &securityv1alpha1.EdgePolicy{}
+				if err := k8sClient.Get(ctx, dcPolicyKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			service := &corev1.Service{
+				Name:      dcServiceName,
+				Namespace: namespace,
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.30"}}
+			Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, dcServiceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("reconciling: first adds the finalizer, second protects and reports")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: dcPolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: dcPolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("confirming the report carries the datacenter and additional ports")
+			Expect(reporter.reports).To(HaveLen(1))
+			report := reporter.reports[0]
+			Expect(report.Datacenter).To(Equal("no-east-az1"))
+			Expect(report.ObservedPorts).To(HaveLen(1))
+			Expect(report.AdditionalPorts).To(HaveLen(2))
+			Expect(report.AdditionalPorts[0].Protocol).To(Equal("ICMP"))
+			Expect(report.AdditionalPorts[1].Port).To(Equal(int32(8080)))
+		})
+
+		It("withdraws the reported ports upstream when the policy is deleted", func() {
+			reporter := &fakeReporter{}
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: reporter,
+			}
+
+			By("creating a filter-enabled EdgePolicy and its LoadBalancer Service")
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      "delete-policy",
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       deleteServiceName,
+					},
+					Datacenter: "no-west-az2",
+					Filter:     &securityv1alpha1.FilterSpec{Enable: true},
+				},
+			}
+			delPolicyKey := types.NamespacedName{Name: "delete-policy", Namespace: namespace}
+			delServiceKey := types.NamespacedName{Name: deleteServiceName, Namespace: namespace}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+
+			service := &corev1.Service{
+				Name:      deleteServiceName,
+				Namespace: namespace,
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.40"}}
+			Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, delServiceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("reconciling so the policy protects the Service and reports once")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: delPolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: delPolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reporter.reports).To(HaveLen(1))
+
+			By("deleting the policy and reconciling the deletion")
+			Expect(k8sClient.Delete(ctx, policy)).To(Succeed())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: delPolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("confirming a withdraw (DELETE) was sent carrying the service and datacenter")
+			Expect(reporter.deletes).To(HaveLen(1))
+			del := reporter.deletes[0]
+			Expect(del.ServiceName).To(Equal(deleteServiceName))
+			Expect(del.Datacenter).To(Equal("no-west-az2"))
+			Expect(del.ObservedPorts).To(HaveLen(1))
+
+			By("confirming the policy finalizer was released so the object is gone")
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, delPolicyKey, &securityv1alpha1.EdgePolicy{}))).To(BeTrue())
 		})
 	})
 
@@ -350,11 +500,10 @@ var _ = Describe("EdgePolicy Controller", func() {
 			reconciler := &EdgePolicyReconciler{
 				Client:   k8sClient,
 				Scheme:   k8sClient.Scheme(),
-				Reporter: upstream.NewHTTPReporter(""),
+				Reporter: upstream.NewHTTPReporter("", false),
 			}
 
 			By("creating an EdgePolicy with acl enabled and its LoadBalancer Service")
-			aclOn := true
 			policy := &securityv1alpha1.EdgePolicy{
 				Name:      policyName,
 				Namespace: namespace,
@@ -364,7 +513,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					ACL: &aclOn,
+					Filter: &securityv1alpha1.FilterSpec{Enable: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -438,7 +587,6 @@ var _ = Describe("EdgePolicy Controller", func() {
 			}
 
 			By("creating an EdgePolicy with acl enabled and its LoadBalancer Service")
-			aclOn := true
 			policy := &securityv1alpha1.EdgePolicy{
 				Name:      policyName,
 				Namespace: namespace,
@@ -448,7 +596,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					ACL: &aclOn,
+					Filter: &securityv1alpha1.FilterSpec{Enable: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -524,7 +672,6 @@ var _ = Describe("EdgePolicy Controller", func() {
 			}
 
 			By("creating an acl-enabled EdgePolicy and a Service referencing an absent Secret")
-			aclOn := true
 			policy := &securityv1alpha1.EdgePolicy{
 				Name:      policyName,
 				Namespace: namespace,
@@ -534,7 +681,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					ACL: &aclOn,
+					Filter: &securityv1alpha1.FilterSpec{Enable: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -608,7 +755,6 @@ var _ = Describe("EdgePolicy Controller", func() {
 			}
 
 			By("creating an acl-enabled EdgePolicy and a Service referencing the Secret")
-			aclOn := true
 			policy := &securityv1alpha1.EdgePolicy{
 				Name:      policyName,
 				Namespace: namespace,
@@ -618,7 +764,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					ACL: &aclOn,
+					Filter: &securityv1alpha1.FilterSpec{Enable: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -703,7 +849,6 @@ var _ = Describe("EdgePolicy Controller", func() {
 			}
 
 			By("creating an acl-enabled EdgePolicy and a Service with no secret annotation")
-			aclOn := true
 			policy := &securityv1alpha1.EdgePolicy{
 				Name:      policyName,
 				Namespace: namespace,
@@ -713,7 +858,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					ACL: &aclOn,
+					Filter: &securityv1alpha1.FilterSpec{Enable: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -761,9 +906,10 @@ var _ = Describe("EdgePolicy Controller", func() {
 	})
 })
 
-// fakeReporter is a test Reporter that records every report it receives.
+// fakeReporter is a test Reporter that records every report and delete it receives.
 type fakeReporter struct {
 	reports []upstream.PortReport
+	deletes []upstream.PortReport
 	err     error
 }
 
@@ -772,5 +918,13 @@ func (f *fakeReporter) ReportPorts(_ context.Context, report upstream.PortReport
 		return f.err
 	}
 	f.reports = append(f.reports, report)
+	return nil
+}
+
+func (f *fakeReporter) DeletePorts(_ context.Context, report upstream.PortReport) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.deletes = append(f.deletes, report)
 	return nil
 }

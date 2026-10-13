@@ -27,19 +27,61 @@ import (
 
 // EdgePolicySpec defines the desired state of EdgePolicy
 //
-// +kubebuilder:validation:XValidation:rule="has(self.acl) || has(self.allowedRegion)",message="At least one of acl or allowedRegion must be specified"
+// +kubebuilder:validation:XValidation:rule="has(self.filter) || has(self.allowedRegion)",message="At least one of filter or allowedRegion must be specified"
 type EdgePolicySpec struct {
 	// TargetRef references the object in the same namespace that this policy applies to.
 	// +required
 	TargetRef TargetReference `json:"targetRef"`
 
-	// Enables service port discovery and reporting to the upstream system.
+	// Filter configures service port discovery and reporting to the upstream system.
 	// +optional
-	ACL *bool `json:"acl,omitempty"`
+	Filter *FilterSpec `json:"filter,omitempty"`
+
+	// Datacenter is the availability zone this policy belongs to. When set, it is
+	// included in the upstream port report.
+	// +optional
+	// +kubebuilder:validation:Enum=no-east-az1;no-east-az2;no-central-az1;no-central-az2;no-west-az1;no-west-az2;no-north-az1;no-north-az2
+	Datacenter string `json:"datacenter,omitempty"`
 
 	// Geographic region policy with optional additional allowed IP ranges.
 	// +optional
 	AllowedRegion *AllowedRegionSpec `json:"allowedRegion,omitempty"`
+}
+
+// FilterSpec configures port-discovery reporting and any additional ports a policy
+// declares beyond those exposed by the target Service.
+type FilterSpec struct {
+	// Enable turns on service port discovery and reporting to the upstream system.
+	// Defaults to false when omitted.
+	// +optional
+	// +kubebuilder:default=false
+	Enable bool `json:"enable,omitempty"`
+
+	// AdditionalPortList declares extra ports to report upstream in addition to the
+	// ports discovered on the target Service.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=256
+	AdditionalPortList []AdditionalPort `json:"additionalPortList,omitempty"`
+}
+
+// AdditionalPort is a user-declared port reported upstream alongside discovered ports.
+type AdditionalPort struct {
+	// Name is an optional label for the port.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name,omitempty"`
+
+	// Port is the port number.
+	// +required
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
+
+	// Protocol is the IP protocol for this port.
+	// +required
+	// +kubebuilder:validation:Enum=TCP;UDP;ICMP;ESP;AH;SCTP;GRE;OSPF;IGMP
+	Protocol string `json:"protocol"`
 }
 
 // TargetReference references an object by apiVersion, kind, and name in the same namespace as the EdgePolicy.

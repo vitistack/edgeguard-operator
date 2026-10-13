@@ -76,6 +76,7 @@ func main() {
 	var enableHTTP2 bool
 	var upstreamURL string
 	var disableUpstreamReporting bool
+	var upstreamInsecureSkipVerify bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -103,6 +104,10 @@ func main() {
 		"If set, upstream reporting is disabled and every report is treated as successfully delivered "+
 			"(no upstream call, no UpstreamReady=False condition). Defaults to the UPSTREAM_REPORTING_DISABLED "+
 			"environment variable. Takes precedence over --upstream-url.")
+	flag.BoolVar(&upstreamInsecureSkipVerify, "upstream-insecure-skip-verify", envBool("UPSTREAM_INSECURE_SKIP_VERIFY"),
+		"If set, upstream TLS certificate verification is skipped. Defaults to the "+
+			"UPSTREAM_INSECURE_SKIP_VERIFY environment variable. Intended for trusted dev/test "+
+			"mirrors with self-signed certificates; do not enable in production.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -225,11 +230,15 @@ func main() {
 		reporter = upstream.NoopReporter{}
 		setupLog.Info("Upstream port reporting disabled; reports are treated as successfully delivered")
 	default:
-		reporter = upstream.NewHTTPReporter(upstreamURL)
+		reporter = upstream.NewHTTPReporter(upstreamURL, upstreamInsecureSkipVerify)
 		if upstreamURL != "" {
 			setupLog.Info("Upstream port reporting enabled", "upstream-url", upstreamURL)
 		} else {
 			setupLog.Info("Upstream port reporting not configured (UPSTREAM_API_URL is empty)")
+		}
+		if upstreamInsecureSkipVerify {
+			setupLog.Info("Upstream TLS verification disabled (UPSTREAM_INSECURE_SKIP_VERIFY); " +
+				"use only with trusted dev/test mirrors")
 		}
 	}
 

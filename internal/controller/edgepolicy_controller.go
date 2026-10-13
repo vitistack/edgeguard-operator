@@ -80,7 +80,7 @@ const (
 
 	// conditionTypeUpstreamReady reports whether upstream port reporting is
 	// configured (i.e. a BaseURL is set from UPSTREAM_API_URL). It is only
-	// evaluated for policies that enable ACL reporting.
+	// evaluated for policies that enable filter reporting.
 	conditionTypeUpstreamReady = "UpstreamReady"
 
 	reasonUpstreamNotConfigured = "UpstreamNotConfigured"
@@ -153,9 +153,18 @@ func (r *EdgePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Handle EdgePolicy deletion: release the Service finalizer, then drop our own.
+	// Handle EdgePolicy deletion: withdraw ports upstream, release the Service
+	// finalizer, then drop our own.
 	if !policy.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&policy, edgePolicyFinalizer) {
+			// Withdraw the policy's ports upstream before we let the object go. A
+			// transient failure holds the finalizer and requeues so the delete is
+			// retried rather than leaving stale upstream state.
+			if err := r.deletePortsUpstream(ctx, &policy, policy.Spec.TargetRef.Name); err != nil {
+				log.Info("Could not withdraw ports upstream during deletion; will retry",
+					"edgepolicy", policy.Name, "retryAfter", upstreamRetryInterval.String(), "error", err.Error())
+				return ctrl.Result{RequeueAfter: upstreamRetryInterval}, nil
+			}
 			if err := r.releaseServiceFinalizer(ctx, &policy); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -195,37 +204,16 @@ func (r *EdgePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// If the Service is being deleted, release our finalizer so it can finish terminating.
 	if !service.DeletionTimestamp.IsZero() {
-		if controllerutil.RemoveFinalizer(service, serviceFinalizer) {
-			if err := r.Update(ctx, service); err != nil {
-				log.Error(err, "Failed to remove finalizer from terminating Service", "service", service.Name)
-				return ctrl.Result{}, err
-			}
-			log.Info("Removed finalizer from terminating Service", "service", service.Name)
-		}
-		changed := setReadyCondition(&policy, metav1.ConditionFalse, reasonServiceTerminating,
-			fmt.Sprintf("Target Service %q is being deleted", service.Name))
-		return ctrl.Result{}, r.writeStatus(ctx, &policy, changed)
+		return r.deactivatePolicy(ctx, &policy, service, reasonServiceTerminating,
+			fmt.Sprintf("Target Service %q is being deleted", service.Name), "terminating Service")
 	}
 
 	// Only Services of type LoadBalancer are managed by this operator. If the target
 	// is any other type, release any finalizer we previously placed and mark the policy
 	// inactive without discovering or reporting ports.
 	if service.Spec.Type != corev1.ServiceTypeLoadBalancer {
-		if controllerutil.RemoveFinalizer(service, serviceFinalizer) {
-			if err := r.Update(ctx, service); err != nil {
-				log.Error(err, "Failed to remove finalizer from non-LoadBalancer Service", "service", service.Name)
-				return ctrl.Result{}, err
-			}
-			log.Info("Removed finalizer from non-LoadBalancer Service", "service", service.Name)
-		}
-		changed := setReadyCondition(&policy, metav1.ConditionFalse, reasonServiceNotLoadBalancer,
-			fmt.Sprintf("Target Service %q is not of type LoadBalancer", service.Name))
-		if len(policy.Status.ObservedPorts) > 0 || len(policy.Status.ObservedIPs) > 0 {
-			policy.Status.ObservedPorts = nil
-			policy.Status.ObservedIPs = nil
-			changed = true
-		}
-		return ctrl.Result{}, r.writeStatus(ctx, &policy, changed)
+		return r.deactivatePolicy(ctx, &policy, service, reasonServiceNotLoadBalancer,
+			fmt.Sprintf("Target Service %q is not of type LoadBalancer", service.Name), "non-LoadBalancer Service")
 	}
 
 	// Add the finalizer to the Service if not already present.
@@ -241,7 +229,7 @@ func (r *EdgePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 }
 
 // reconcileProtectedService records the discovered ports and IPs of a protected
-// LoadBalancer Service on the policy status, reports them upstream when ACL is
+// LoadBalancer Service on the policy status, reports them upstream when filter is
 // enabled, and persists the status only when something actually changed.
 //
 // A transient upstream report failure is treated as soft: it is logged at Info
@@ -252,18 +240,24 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 	policy *securityv1alpha1.EdgePolicy, service *corev1.Service) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// Capture whether the spec changed since our last status write before any
+	// status mutation below advances ObservedGeneration. A spec change (e.g. an
+	// edit to datacenter or filter.additionalPortList) must re-trigger a report
+	// even when the discovered ports and IPs are unchanged.
+	generationChanged := policy.Generation != policy.Status.ObservedGeneration
+
 	// Reflect that the target Service is now protected by this policy.
 	condChanged := setReadyCondition(policy, metav1.ConditionTrue, reasonServiceProtected,
 		fmt.Sprintf("Finalizer present on Service %q", service.Name))
 
-	// Resolve the IPAM secret (when ACL reporting is enabled) and surface its
+	// Resolve the IPAM secret (when filter reporting is enabled) and surface its
 	// state on the status. A missing Secret is tolerated: the policy reports a
 	// not-found condition but reconciliation continues with an empty credential.
 	var ipamSecret string
 	secretChanged := false
 	upstreamChanged := false
 	upstreamConfigured := false
-	if aclEnabled(policy) {
+	if filterEnabled(policy) {
 		value, state, err := r.resolveIpamSecret(ctx, service)
 		if err != nil {
 			log.Error(err, "Failed to resolve IPAM secret", "service", service.Name)
@@ -289,8 +283,8 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 	desiredIPs := loadBalancerIPs(service)
 	portsChanged := !observedPortsEqual(policy.Status.ObservedPorts, desiredPorts)
 	ipsChanged := !stringSlicesEqual(policy.Status.ObservedIPs, desiredIPs)
-	if portsChanged || ipsChanged {
-		if aclEnabled(policy) && upstreamConfigured {
+	if portsChanged || ipsChanged || generationChanged {
+		if filterEnabled(policy) && upstreamConfigured {
 			if err := r.reportPortsUpstream(ctx, policy, service, ipamSecret, desiredPorts, desiredIPs); err != nil {
 				// Transient upstream failures (DNS, connectivity, 5xx) are expected and
 				// self-healing. Log softly, surface the failure on the status so it is
@@ -359,9 +353,27 @@ func observedPortsEqual(a, b []securityv1alpha1.ObservedPort) bool {
 	return true
 }
 
-// aclEnabled reports whether the policy opts into upstream port reporting via spec.acl.
-func aclEnabled(policy *securityv1alpha1.EdgePolicy) bool {
-	return policy.Spec.ACL != nil && *policy.Spec.ACL
+// filterEnabled reports whether the policy opts into upstream port reporting via
+// spec.filter.enable.
+func filterEnabled(policy *securityv1alpha1.EdgePolicy) bool {
+	return policy.Spec.Filter != nil && policy.Spec.Filter.Enable
+}
+
+// additionalPorts maps the policy's declared spec.filter.additionalPortList into the
+// upstream payload representation.
+func additionalPorts(policy *securityv1alpha1.EdgePolicy) []upstream.Port {
+	if policy.Spec.Filter == nil || len(policy.Spec.Filter.AdditionalPortList) == 0 {
+		return nil
+	}
+	ports := make([]upstream.Port, 0, len(policy.Spec.Filter.AdditionalPortList))
+	for _, p := range policy.Spec.Filter.AdditionalPortList {
+		ports = append(ports, upstream.Port{
+			Name:     p.Name,
+			Port:     p.Port,
+			Protocol: p.Protocol,
+		})
+	}
+	return ports
 }
 
 // reportPortsUpstream sends the discovered ports to the external system via the
@@ -381,16 +393,20 @@ func (r *EdgePolicyReconciler) reportPortsUpstream(ctx context.Context, policy *
 
 	ipv4, ipv6 := splitIPFamilies(ips)
 	report := upstream.PortReport{
-		ClusterID:     clusterID,
-		ServiceName:   service.Name,
-		IpamZone:      service.Annotations[zoneAnnotation],
-		IpamSecret:    ipamSecret,
-		IPv4Addresses: ipv4,
-		IPv6Addresses: ipv6,
-		Ports:         make([]upstream.Port, 0, len(ports)),
+		ClusterID:             clusterID,
+		EdgePolicyNamespaceID: r.namespaceUID(ctx, policy.Namespace),
+		EdgePolicyID:          string(policy.UID),
+		ServiceName:           service.Name,
+		Datacenter:            policy.Spec.Datacenter,
+		IpamZone:              service.Annotations[zoneAnnotation],
+		IpamSecret:            ipamSecret,
+		IPv4Addresses:         ipv4,
+		IPv6Addresses:         ipv6,
+		ObservedPorts:         make([]upstream.Port, 0, len(ports)),
+		AdditionalPorts:       additionalPorts(policy),
 	}
 	for _, p := range ports {
-		report.Ports = append(report.Ports, upstream.Port{
+		report.ObservedPorts = append(report.ObservedPorts, upstream.Port{
 			Name:     p.Name,
 			Port:     p.Port,
 			Protocol: string(p.Protocol),
@@ -410,6 +426,84 @@ func (r *EdgePolicyReconciler) reportPortsUpstream(ctx context.Context, policy *
 	return nil
 }
 
+// deactivatePolicy releases the operator's hold on a Service that is no longer
+// managed (it is terminating or is no longer a LoadBalancer): it withdraws any
+// previously reported ports upstream, removes the Service finalizer, and marks the
+// policy inactive with the given reason/message. A transient upstream withdraw
+// failure requeues after upstreamRetryInterval and keeps the finalizer so the
+// delete is retried rather than leaving stale upstream state. note labels the log
+// lines with the triggering transition.
+func (r *EdgePolicyReconciler) deactivatePolicy(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
+	service *corev1.Service, reason, message, note string) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	hadState := len(policy.Status.ObservedPorts) > 0 || len(policy.Status.ObservedIPs) > 0
+	if hadState {
+		if err := r.deletePortsUpstream(ctx, policy, service.Name); err != nil {
+			log.Info("Could not withdraw ports upstream; will retry",
+				"service", service.Name, "transition", note,
+				"retryAfter", upstreamRetryInterval.String(), "error", err.Error())
+			return ctrl.Result{RequeueAfter: upstreamRetryInterval}, nil
+		}
+	}
+	if controllerutil.RemoveFinalizer(service, serviceFinalizer) {
+		if err := r.Update(ctx, service); err != nil {
+			log.Error(err, "Failed to remove finalizer from Service", "service", service.Name, "transition", note)
+			return ctrl.Result{}, err
+		}
+		log.Info("Removed finalizer from Service", "service", service.Name, "transition", note)
+	}
+	changed := setReadyCondition(policy, metav1.ConditionFalse, reason, message)
+	if hadState {
+		policy.Status.ObservedPorts = nil
+		policy.Status.ObservedIPs = nil
+		changed = true
+	}
+	return ctrl.Result{}, r.writeStatus(ctx, policy, changed)
+}
+
+// deletePortsUpstream withdraws a policy's previously reported ports from the
+// upstream system when the policy or its target Service is removed. The report is
+// reconstructed from the policy status (last observed ports and IPs) plus the
+// datacenter and declared additional ports from the spec. It is a no-op unless the
+// policy enables filter reporting and the Reporter is configured.
+func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
+	policy *securityv1alpha1.EdgePolicy, serviceName string) error {
+	if !filterEnabled(policy) || !reporterConfigured(r.Reporter) || r.Reporter == nil {
+		return nil
+	}
+
+	clusterID, err := r.clusterUID(ctx)
+	if err != nil {
+		return fmt.Errorf("resolving cluster ID: %w", err)
+	}
+
+	ipv4, ipv6 := splitIPFamilies(policy.Status.ObservedIPs)
+	report := upstream.PortReport{
+		ClusterID:             clusterID,
+		EdgePolicyNamespaceID: r.namespaceUID(ctx, policy.Namespace),
+		EdgePolicyID:          string(policy.UID),
+		ServiceName:           serviceName,
+		Datacenter:            policy.Spec.Datacenter,
+		IPv4Addresses:         ipv4,
+		IPv6Addresses:         ipv6,
+		ObservedPorts:         make([]upstream.Port, 0, len(policy.Status.ObservedPorts)),
+		AdditionalPorts:       additionalPorts(policy),
+	}
+	for _, p := range policy.Status.ObservedPorts {
+		report.ObservedPorts = append(report.ObservedPorts, upstream.Port{
+			Name:     p.Name,
+			Port:     p.Port,
+			Protocol: string(p.Protocol),
+		})
+	}
+	if err := r.Reporter.DeletePorts(ctx, report); err != nil {
+		return err
+	}
+	logf.FromContext(ctx).Info("Withdrew ports upstream",
+		"edgepolicy", policy.Name, "service", serviceName)
+	return nil
+}
+
 // clusterUID returns the UID of the kube-system namespace, used as a stable
 // cluster identifier. A missing kube-system namespace yields an empty UID
 // rather than an error.
@@ -422,6 +516,18 @@ func (r *EdgePolicyReconciler) clusterUID(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return string(ns.UID), nil
+}
+
+// namespaceUID returns the UID of the named namespace, used to identify the
+// EdgePolicy's namespace upstream. A missing or unreadable namespace yields an
+// empty string rather than failing the report, since the UID is informational.
+func (r *EdgePolicyReconciler) namespaceUID(ctx context.Context, name string) string {
+	var ns corev1.Namespace
+	if err := r.Get(ctx, types.NamespacedName{Name: name}, &ns); err != nil {
+		logf.FromContext(ctx).V(1).Info("Could not resolve namespace UID", "namespace", name, "error", err.Error())
+		return ""
+	}
+	return string(ns.UID)
 }
 
 // ipamSecretState captures how the ipam.vitistack.io/secret reference resolved.
@@ -627,17 +733,22 @@ func (r *EdgePolicyReconciler) releaseServiceFinalizer(ctx context.Context, poli
 	log := logf.FromContext(ctx)
 	ref := policy.Spec.TargetRef
 
-	// Check for other EdgePolicies that still reference the same Service.
+	// Check for other EdgePolicies that still reference the same Service. We list
+	// by namespace and match in-memory rather than via the targetRefField index:
+	// this runs on the deletion path where correctness must not depend on the
+	// manager cache's field index being available.
+	wantKey := targetRefKey(ref.APIVersion, ref.Kind, ref.Name)
 	var policies securityv1alpha1.EdgePolicyList
-	if err := r.List(ctx, &policies,
-		client.InNamespace(policy.Namespace),
-		client.MatchingFields{targetRefField: targetRefKey(ref.APIVersion, ref.Kind, ref.Name)},
-	); err != nil {
+	if err := r.List(ctx, &policies, client.InNamespace(policy.Namespace)); err != nil {
 		return err
 	}
 	for i := range policies.Items {
 		other := &policies.Items[i]
 		if other.UID == policy.UID {
+			continue
+		}
+		otherRef := other.Spec.TargetRef
+		if targetRefKey(otherRef.APIVersion, otherRef.Kind, otherRef.Name) != wantKey {
 			continue
 		}
 		// Another policy that is not being deleted still needs the Service protected.

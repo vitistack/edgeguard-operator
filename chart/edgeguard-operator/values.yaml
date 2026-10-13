@@ -34,20 +34,43 @@ manager:
   ## Used to configure upstream port reporting (see the project README).
   ##   - UPSTREAM_API_URL: base URL of the upstream IPAM API that receives
   ##     port reports. Leave unset to disable reporting; policies with
-  ##     acl: true then report UpstreamReady=False/UpstreamNotConfigured.
+  ##     filter.enable: true then report UpstreamReady=False/UpstreamNotConfigured.
   ##   - UPSTREAM_REPORTING_DISABLED: set to "true" to treat every report as
   ##     delivered without any outbound call (takes precedence over the URL).
+  ##   - UPSTREAM_INSECURE_SKIP_VERIFY: set to "true" to skip upstream TLS
+  ##     certificate verification. For trusted dev/test mirrors with self-signed
+  ##     certificates only; do not enable in production.
   ##
   # env:
   #   - name: UPSTREAM_API_URL
   #     value: "https://edgeguard-api.vitistack.io/v1"
   #   - name: UPSTREAM_REPORTING_DISABLED
   #     value: "false"
+  #   - name: UPSTREAM_INSECURE_SKIP_VERIFY
+  #     value: "false"
   env:
     - name: UPSTREAM_API_URL
       value: "https://edgeguard-api.vitistack.io/v1"
     - name: UPSTREAM_REPORTING_DISABLED
       value: "false"
+    - name: UPSTREAM_INSECURE_SKIP_VERIFY
+      value: "false"
+
+  ## CA certificate bundle mount.
+  ## Mount a CA bundle (e.g. an internal/corporate root CA) from a ConfigMap into
+  ## the manager so it can verify TLS when the upstream API presents certificates
+  ## signed by that CA. Create the ConfigMap in the release namespace yourself;
+  ## this only mounts it. Prefer this over UPSTREAM_INSECURE_SKIP_VERIFY.
+  ##
+  caBundle:
+    ## Set to true to mount the CA bundle ConfigMap into the manager container.
+    enabled: true
+    ## Name of the ConfigMap holding the CA bundle.
+    configMapName: nhn-certbundle
+    ## Key within the ConfigMap, also used as the mounted file name (subPath).
+    fileName: nhn-certbundle.crt
+    ## Absolute path the bundle file is mounted at inside the container.
+    mountPath: /etc/ssl/certs/nhn-certbundle.crt
 
   ## Health probes.
   ## The manager serves the liveness (/healthz) and readiness (/readyz) endpoints on this port.

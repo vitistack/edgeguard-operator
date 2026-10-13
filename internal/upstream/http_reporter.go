@@ -19,6 +19,7 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -41,6 +42,10 @@ type HTTPReporter struct {
 	// It is sourced from the UPSTREAM_API_URL environment variable; an empty value
 	// means upstream reporting is not configured.
 	BaseURL string
+	// InsecureSkipVerify disables upstream TLS certificate verification. It is
+	// opt-in via the UPSTREAM_INSECURE_SKIP_VERIFY environment variable and is only
+	// intended for trusted dev/test mirrors with self-signed certificates.
+	InsecureSkipVerify bool
 	// Client is the HTTP client used for requests. If nil, a client with
 	// defaultTimeout is used.
 	Client *http.Client
@@ -48,11 +53,21 @@ type HTTPReporter struct {
 
 // NewHTTPReporter builds an HTTPReporter for the given base URL. A zero-value
 // baseURL yields a reporter that is not Configured and whose ReportPorts always
-// errors, which callers should treat as a misconfiguration.
-func NewHTTPReporter(baseURL string) *HTTPReporter {
+// errors, which callers should treat as a misconfiguration. When insecureSkipVerify
+// is true the HTTP client skips upstream TLS verification (dev/test mirrors only).
+func NewHTTPReporter(baseURL string, insecureSkipVerify bool) *HTTPReporter {
+	client := &http.Client{Timeout: defaultTimeout}
+	if insecureSkipVerify {
+		client.Transport = &http.Transport{
+			// InsecureSkipVerify is gated behind an explicit opt-in env var and is
+			// documented as dev/test-only, so disabling verification here is intentional.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // opt-in via UPSTREAM_INSECURE_SKIP_VERIFY
+		}
+	}
 	return &HTTPReporter{
-		BaseURL: baseURL,
-		Client:  &http.Client{Timeout: defaultTimeout},
+		BaseURL:            baseURL,
+		InsecureSkipVerify: insecureSkipVerify,
+		Client:             client,
 	}
 }
 
@@ -69,6 +84,19 @@ func (h *HTTPReporter) Configured() bool {
 // TODO(user): This is scaffolding. Validate the endpoint path, auth, and
 // response handling against the real upstream service before relying on it.
 func (h *HTTPReporter) ReportPorts(ctx context.Context, report PortReport) error {
+	return h.send(ctx, http.MethodPost, report)
+}
+
+// DeletePorts implements Reporter by sending an HTTP DELETE with the report body
+// to <BaseURL>/v1/port-reports, withdrawing a previously reported port set when the
+// policy or its target Service is removed.
+func (h *HTTPReporter) DeletePorts(ctx context.Context, report PortReport) error {
+	return h.send(ctx, http.MethodDelete, report)
+}
+
+// send marshals the report and issues a single request to the port-reports
+// endpoint with the given HTTP method.
+func (h *HTTPReporter) send(ctx context.Context, method string, report PortReport) error {
 	if h.BaseURL == "" {
 		return fmt.Errorf("upstream HTTPReporter has no BaseURL configured")
 	}
@@ -80,7 +108,7 @@ func (h *HTTPReporter) ReportPorts(ctx context.Context, report PortReport) error
 
 	// TODO(user): confirm the real endpoint path and method.
 	endpoint := h.BaseURL + "/v1/port-reports"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("building upstream request: %w", err)
 	}

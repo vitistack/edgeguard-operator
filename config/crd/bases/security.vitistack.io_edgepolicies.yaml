@@ -63,10 +63,6 @@ spec:
           spec:
             description: spec defines the desired state of EdgePolicy
             properties:
-              acl:
-                description: Enables service port discovery and reporting to the upstream
-                  system.
-                type: boolean
               allowedRegion:
                 description: Geographic region policy with optional additional allowed
                   IP ranges.
@@ -92,6 +88,69 @@ spec:
                     type: string
                 required:
                 - region
+                type: object
+              datacenter:
+                description: |-
+                  Datacenter is the availability zone this policy belongs to. When set, it is
+                  included in the upstream port report.
+                enum:
+                - no-east-az1
+                - no-east-az2
+                - no-central-az1
+                - no-central-az2
+                - no-west-az1
+                - no-west-az2
+                - no-north-az1
+                - no-north-az2
+                type: string
+              filter:
+                description: Filter configures service port discovery and reporting
+                  to the upstream system.
+                properties:
+                  additionalPortList:
+                    description: |-
+                      AdditionalPortList declares extra ports to report upstream in addition to the
+                      ports discovered on the target Service.
+                    items:
+                      description: AdditionalPort is a user-declared port reported
+                        upstream alongside discovered ports.
+                      properties:
+                        name:
+                          description: Name is an optional label for the port.
+                          maxLength: 63
+                          type: string
+                        port:
+                          description: Port is the port number.
+                          format: int32
+                          maximum: 65535
+                          minimum: 0
+                          type: integer
+                        protocol:
+                          description: Protocol is the IP protocol for this port.
+                          enum:
+                          - TCP
+                          - UDP
+                          - ICMP
+                          - ESP
+                          - AH
+                          - SCTP
+                          - GRE
+                          - OSPF
+                          - IGMP
+                          type: string
+                      required:
+                      - port
+                      - protocol
+                      type: object
+                    maxItems: 256
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  enable:
+                    default: false
+                    description: |-
+                      Enable turns on service port discovery and reporting to the upstream system.
+                      Defaults to false when omitted.
+                    type: boolean
                 type: object
               targetRef:
                 description: TargetRef references the object in the same namespace
@@ -122,8 +181,8 @@ spec:
             - targetRef
             type: object
             x-kubernetes-validations:
-            - message: At least one of acl or allowedRegion must be specified
-              rule: has(self.acl) || has(self.allowedRegion)
+            - message: At least one of filter or allowedRegion must be specified
+              rule: has(self.filter) || has(self.allowedRegion)
           status:
             description: status defines the observed state of EdgePolicy
             properties:
