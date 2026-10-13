@@ -1,0 +1,9 @@
+apiVersion: security.vitistack.io/v1alpha1
+kind: EdgePolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: edgeguard-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: edgepolicy-sample
+spec:
+  # TODO(user): Add fields here

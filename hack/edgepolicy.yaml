@@ -1,0 +1,15 @@
+apiVersion: security.vitistack.io/v1alpha1
+kind: EdgePolicy
+metadata:
+  name: my-edge-policy
+spec:
+  acl: true
+  allowedRegion:
+    region: nordics
+    additionalAllowList:
+      - 192.168.10.0/24
+      - 2001:db8:1234::/48
+  targetRef:
+    apiVersion: v1
+    kind: Service
+    name: my-service
