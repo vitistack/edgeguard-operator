@@ -16,7 +16,11 @@ limitations under the License.
 
 package upstream
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
 
 // protoTCP and portHTTP avoid repeating literals across fixtures (goconst).
 const (
@@ -77,6 +81,67 @@ func TestIdempotencyKeyChangesWithDedupeFields(t *testing.T) {
 			mutate(&r)
 			if r.IdempotencyKey() == baseKey {
 				t.Fatalf("expected key to change when %s changes", name)
+			}
+		})
+	}
+}
+
+func TestValidate(t *testing.T) {
+	// baseReport carries a credential and both IP families, so it needs a secret
+	// added to be complete; the upstream requires IpamSecret plus at least one IP.
+	complete := baseReport()
+	complete.IpamSecret = "cr3d"
+	if err := complete.Validate(); err != nil {
+		t.Fatalf("expected complete report to validate, got %v", err)
+	}
+
+	cases := map[string]struct {
+		mutate    func(r *PortReport)
+		wantErr   bool
+		wantField string
+	}{
+		"missing secret": {
+			mutate:    func(r *PortReport) { r.IpamSecret = "" },
+			wantErr:   true,
+			wantField: "ipamSecret",
+		},
+		"missing all addresses": {
+			mutate:    func(r *PortReport) { r.IPv4Addresses = nil; r.IPv6Addresses = nil },
+			wantErr:   true,
+			wantField: "ipAddresses",
+		},
+		"only ipv6 present is complete": {
+			mutate:  func(r *PortReport) { r.IPv4Addresses = nil },
+			wantErr: false,
+		},
+		"only ipv4 present is complete": {
+			mutate:  func(r *PortReport) { r.IPv6Addresses = nil },
+			wantErr: false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := baseReport()
+			r.IpamSecret = "cr3d"
+			tc.mutate(&r)
+			err := r.Validate()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got nil")
+				}
+				if !errors.Is(err, ErrIncompleteReport) {
+					t.Fatalf("expected ErrIncompleteReport, got %v", err)
+				}
+				if tc.wantField != "" && !strings.Contains(err.Error(), tc.wantField) {
+					t.Fatalf("expected error to name %q, got %v", tc.wantField, err)
+				}
+				// The error must never leak the credential value.
+				if strings.Contains(err.Error(), "cr3d") {
+					t.Fatalf("validation error leaked the credential: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("expected no error, got %v", err)
 			}
 		})
 	}

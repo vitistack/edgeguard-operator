@@ -301,7 +301,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 			secret := &corev1.Secret{
 				Name:      "my-secret",
 				Namespace: namespace,
-				Data:      map[string][]byte{"secret": []byte("s3cr3t")},
+				Data:      map[string][]byte{secretDataKey: []byte("s3cr3t")},
 			}
 			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
 			DeferCleanup(func() {
@@ -386,6 +386,9 @@ var _ = Describe("EdgePolicy Controller", func() {
 			service := &corev1.Service{
 				Name:      dcServiceName,
 				Namespace: namespace,
+				Annotations: map[string]string{
+					secretAnnotation: "dc-secret",
+				},
 				Spec: corev1.ServiceSpec{
 					Type:  corev1.ServiceTypeLoadBalancer,
 					Ports: []corev1.ServicePort{{Port: 443}},
@@ -401,6 +404,17 @@ var _ = Describe("EdgePolicy Controller", func() {
 					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
 					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
 				}
+			})
+
+			By("creating the Secret the target Service references")
+			dcSecret := &corev1.Secret{
+				Name:      "dc-secret",
+				Namespace: namespace,
+				Data:      map[string][]byte{secretDataKey: []byte("dc-cr3d")},
+			}
+			Expect(k8sClient.Create(ctx, dcSecret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, dcSecret)
 			})
 
 			By("reconciling: first adds the finalizer, second protects and reports")
@@ -473,7 +487,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 			delSecret := &corev1.Secret{
 				Name:      "delete-secret",
 				Namespace: namespace,
-				Data:      map[string][]byte{"secret": []byte("d3l3te-cr3d")},
+				Data:      map[string][]byte{secretDataKey: []byte("d3l3te-cr3d")},
 			}
 			Expect(k8sClient.Create(ctx, delSecret)).To(Succeed())
 			DeferCleanup(func() {
@@ -638,6 +652,9 @@ var _ = Describe("EdgePolicy Controller", func() {
 			service := &corev1.Service{
 				Name:      serviceName,
 				Namespace: namespace,
+				Annotations: map[string]string{
+					secretAnnotation: "failing-report-secret",
+				},
 				Spec: corev1.ServiceSpec{
 					Type:  corev1.ServiceTypeLoadBalancer,
 					Ports: []corev1.ServicePort{{Port: 443}},
@@ -653,6 +670,17 @@ var _ = Describe("EdgePolicy Controller", func() {
 					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
 					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
 				}
+			})
+
+			By("creating the Secret the target Service references")
+			failSecret := &corev1.Secret{
+				Name:      "failing-report-secret",
+				Namespace: namespace,
+				Data:      map[string][]byte{secretDataKey: []byte("fail-cr3d")},
+			}
+			Expect(k8sClient.Create(ctx, failSecret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, failSecret)
 			})
 
 			By("reconciling: first adds the finalizer, second attempts the failing report")
@@ -672,9 +700,241 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonUpstreamReportFailed))
 
-			By("confirming observed ports were not recorded, so the retry re-reports")
+			By("confirming Ready is False while the report has not been accepted upstream")
+			ready := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(reasonUpstreamReportFailed))
 			Expect(reconciled.Status.ObservedPorts).To(BeEmpty())
 			Expect(reconciled.Status.ObservedIPs).To(BeEmpty())
+		})
+	})
+
+	Context("When the upstream rejects a report with a 4xx", func() {
+		const (
+			policyName  = "report-reject-policy"
+			namespace   = "default"
+			serviceName = "report-reject-service"
+		)
+
+		ctx := context.Background()
+		policyKey := types.NamespacedName{Name: policyName, Namespace: namespace}
+		serviceKey := types.NamespacedName{Name: serviceName, Namespace: namespace}
+
+		It("surfaces UpstreamReportRejected as terminal and does not requeue on the timer", func() {
+			By("using a reporter that returns a terminal 4xx rejection")
+			reporter := &fakeReporter{err: fmt.Errorf("%w: status 400", upstream.ErrUpstreamRejected)}
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: reporter,
+			}
+
+			By("creating a filter-enabled EdgePolicy and its LoadBalancer Service")
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      policyName,
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       serviceName,
+					},
+					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &securityv1alpha1.EdgePolicy{}
+				if err := k8sClient.Get(ctx, policyKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			service := &corev1.Service{
+				Name:      serviceName,
+				Namespace: namespace,
+				Annotations: map[string]string{
+					secretAnnotation: "reject-secret",
+				},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.40"}}
+			Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, serviceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("creating the Secret the target Service references")
+			rejectSecret := &corev1.Secret{
+				Name:      "reject-secret",
+				Namespace: namespace,
+				Data:      map[string][]byte{secretDataKey: []byte("reject-cr3d")},
+			}
+			Expect(k8sClient.Create(ctx, rejectSecret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, rejectSecret)
+			})
+
+			By("reconciling: first adds the finalizer, second attempts the rejected report")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("confirming the rejection is terminal: no error, and no timed requeue")
+			Expect(result.RequeueAfter).To(BeZero())
+
+			By("confirming the rejection is surfaced on the status")
+			reconciled := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, reconciled)).To(Succeed())
+			upCond := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(upCond).NotTo(BeNil())
+			Expect(upCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(upCond.Reason).To(Equal(reasonUpstreamRejected))
+
+			By("confirming Ready is False for the same reason")
+			ready := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(reasonUpstreamRejected))
+
+			By("confirming observed ports were not recorded, so a change re-reports")
+			Expect(reconciled.Status.ObservedPorts).To(BeEmpty())
+			Expect(reconciled.Status.ObservedIPs).To(BeEmpty())
+		})
+	})
+
+	Context("When a rejected report is unchanged on later reconciles", func() {
+		const (
+			policyName  = "report-suppress-policy"
+			namespace   = "default"
+			serviceName = "report-suppress-service"
+		)
+
+		ctx := context.Background()
+		policyKey := types.NamespacedName{Name: policyName, Namespace: namespace}
+		serviceKey := types.NamespacedName{Name: serviceName, Namespace: namespace}
+
+		It("suppresses the identical report and re-attempts only when the content changes", func() {
+			By("using a reporter that keeps returning a terminal 4xx rejection")
+			reporter := &fakeReporter{err: fmt.Errorf("%w: status 400", upstream.ErrUpstreamRejected)}
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: reporter,
+			}
+
+			By("creating a filter-enabled EdgePolicy and its LoadBalancer Service")
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      policyName,
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       serviceName,
+					},
+					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &securityv1alpha1.EdgePolicy{}
+				if err := k8sClient.Get(ctx, policyKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			service := &corev1.Service{
+				Name:      serviceName,
+				Namespace: namespace,
+				Annotations: map[string]string{
+					secretAnnotation: "suppress-secret",
+				},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Name: "https", Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.41"}}
+			Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, serviceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("creating the Secret the target Service references")
+			suppressSecret := &corev1.Secret{
+				Name:      "suppress-secret",
+				Namespace: namespace,
+				Data:      map[string][]byte{secretDataKey: []byte("suppress-cr3d")},
+			}
+			Expect(k8sClient.Create(ctx, suppressSecret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, suppressSecret)
+			})
+
+			By("reconciling until the report is attempted and rejected")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			attemptsAfterReject := reporter.reportAttempts
+			Expect(attemptsAfterReject).To(BeNumerically(">=", 1))
+
+			By("confirming the rejected report's key was remembered on the status")
+			rejected := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, rejected)).To(Succeed())
+			Expect(rejected.Status.RejectedReportKey).NotTo(BeEmpty())
+
+			By("reconciling again with unchanged content: the report is suppressed, not re-sent")
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+			Expect(reporter.reportAttempts).To(Equal(attemptsAfterReject))
+
+			By("reconciling once more: still suppressed and steady (no status churn to re-enqueue)")
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reporter.reportAttempts).To(Equal(attemptsAfterReject))
+
+			By("confirming the terminal Rejected status is still in place")
+			stillRejected := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, stillRejected)).To(Succeed())
+			upCond := meta.FindStatusCondition(stillRejected.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(upCond).NotTo(BeNil())
+			Expect(upCond.Reason).To(Equal(reasonUpstreamRejected))
+
+			By("changing the Service content: a different report is attempted afresh")
+			fetchedSvc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, serviceKey, fetchedSvc)).To(Succeed())
+			fetchedSvc.Spec.Ports = append(fetchedSvc.Spec.Ports, corev1.ServicePort{Name: "http", Port: 8080})
+			Expect(k8sClient.Update(ctx, fetchedSvc)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reporter.reportAttempts).To(BeNumerically(">", attemptsAfterReject))
 		})
 	})
 
@@ -689,7 +949,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 		policyKey := types.NamespacedName{Name: policyName, Namespace: namespace}
 		serviceKey := types.NamespacedName{Name: serviceName, Namespace: namespace}
 
-		It("still reports with an empty secret and flags it on the status", func() {
+		It("withholds the report and flags the missing secret on the status", func() {
 			reporter := &fakeReporter{}
 			reconciler := &EdgePolicyReconciler{
 				Client:   k8sClient,
@@ -748,9 +1008,8 @@ var _ = Describe("EdgePolicy Controller", func() {
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("confirming the report was still sent, with an empty secret")
-			Expect(reporter.reports).To(HaveLen(1))
-			Expect(reporter.reports[0].IpamSecret).To(BeEmpty())
+			By("confirming no report was sent because the credential is missing")
+			Expect(reporter.reports).To(BeEmpty())
 
 			By("confirming the missing Secret is surfaced on the status")
 			reconciled := &securityv1alpha1.EdgePolicy{}
@@ -759,6 +1018,18 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonSecretNotFound))
+
+			By("confirming the report was withheld as incomplete on the status")
+			upCond := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(upCond).NotTo(BeNil())
+			Expect(upCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(upCond.Reason).To(Equal(reasonUpstreamIncomplete))
+
+			By("confirming Ready is False while the report is withheld as incomplete")
+			ready := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(reasonUpstreamIncomplete))
 		})
 	})
 
@@ -773,7 +1044,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 		policyKey := types.NamespacedName{Name: policyName, Namespace: namespace}
 		serviceKey := types.NamespacedName{Name: serviceName, Namespace: namespace}
 
-		It("still reports with an empty secret and flags it invalid on the status", func() {
+		It("withholds the report and flags the invalid secret on the status", func() {
 			reporter := &fakeReporter{}
 			reconciler := &EdgePolicyReconciler{
 				Client:   k8sClient,
@@ -843,9 +1114,8 @@ var _ = Describe("EdgePolicy Controller", func() {
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("confirming the report was still sent, with an empty secret")
-			Expect(reporter.reports).To(HaveLen(1))
-			Expect(reporter.reports[0].IpamSecret).To(BeEmpty())
+			By("confirming no report was sent because the credential is missing")
+			Expect(reporter.reports).To(BeEmpty())
 
 			By("confirming the invalid Secret is surfaced on the status")
 			reconciled := &securityv1alpha1.EdgePolicy{}
@@ -854,6 +1124,18 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonSecretInvalid))
+
+			By("confirming the report was withheld as incomplete on the status")
+			upCond := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(upCond).NotTo(BeNil())
+			Expect(upCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(upCond.Reason).To(Equal(reasonUpstreamIncomplete))
+
+			By("confirming Ready is False while the report is withheld as incomplete")
+			ready := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(reasonUpstreamIncomplete))
 		})
 	})
 
@@ -931,6 +1213,142 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(reasonSecretNotConfigured))
+
+			By("confirming no report was sent and it is flagged incomplete on the status")
+			Expect(reporter.reports).To(BeEmpty())
+			upCond := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(upCond).NotTo(BeNil())
+			Expect(upCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(upCond.Reason).To(Equal(reasonUpstreamIncomplete))
+
+			By("confirming Ready is False while the report is withheld as incomplete")
+			ready := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(reasonUpstreamIncomplete))
+		})
+	})
+
+	Context("When the Service has a secret but no load balancer address", func() {
+		const (
+			policyName  = "no-ip-policy"
+			namespace   = "default"
+			serviceName = "no-ip-service"
+		)
+
+		ctx := context.Background()
+		policyKey := types.NamespacedName{Name: policyName, Namespace: namespace}
+		serviceKey := types.NamespacedName{Name: serviceName, Namespace: namespace}
+
+		It("withholds the report and flags it incomplete until an address is assigned", func() {
+			reporter := &fakeReporter{}
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: reporter,
+			}
+
+			By("creating a filter-enabled EdgePolicy and a Service with a resolvable secret")
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      policyName,
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       serviceName,
+					},
+					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &securityv1alpha1.EdgePolicy{}
+				if err := k8sClient.Get(ctx, policyKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			service := &corev1.Service{
+				Name:      serviceName,
+				Namespace: namespace,
+				Annotations: map[string]string{
+					secretAnnotation: "no-ip-secret",
+				},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, serviceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("creating the Secret the target Service references")
+			noIPSecret := &corev1.Secret{
+				Name:      "no-ip-secret",
+				Namespace: namespace,
+				Data:      map[string][]byte{secretDataKey: []byte("no-ip-cr3d")},
+			}
+			Expect(k8sClient.Create(ctx, noIPSecret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, noIPSecret)
+			})
+
+			By("reconciling while the Service has no load balancer ingress yet")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("confirming no report was sent, the status is incomplete, and a retry is queued")
+			Expect(reporter.reports).To(BeEmpty())
+			Expect(result.RequeueAfter).To(Equal(upstreamRetryInterval))
+			reconciled := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, reconciled)).To(Succeed())
+			upCond := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(upCond).NotTo(BeNil())
+			Expect(upCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(upCond.Reason).To(Equal(reasonUpstreamIncomplete))
+
+			By("confirming Ready is False while the report is withheld as incomplete")
+			ready := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(reasonUpstreamIncomplete))
+
+			By("confirming observed ports were not recorded, so the retry re-reports")
+			Expect(reconciled.Status.ObservedPorts).To(BeEmpty())
+
+			By("assigning a load balancer address and reconciling again")
+			current := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, serviceKey, current)).To(Succeed())
+			current.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.50"}}
+			Expect(k8sClient.Status().Update(ctx, current)).To(Succeed())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("confirming the now-complete report was sent with the credential and address")
+			Expect(reporter.reports).To(HaveLen(1))
+			Expect(reporter.reports[0].IpamSecret).To(Equal("no-ip-cr3d"))
+			Expect(reporter.reports[0].IPv4Addresses).To(ConsistOf("203.0.113.50"))
+
+			By("confirming Ready recovers to True once the report is accepted upstream")
+			recovered := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, recovered)).To(Succeed())
+			readyNow := meta.FindStatusCondition(recovered.Status.Conditions, conditionTypeReady)
+			Expect(readyNow).NotTo(BeNil())
+			Expect(readyNow.Status).To(Equal(metav1.ConditionTrue))
+			Expect(readyNow.Reason).To(Equal(reasonServiceProtected))
 		})
 	})
 })
@@ -939,10 +1357,14 @@ var _ = Describe("EdgePolicy Controller", func() {
 type fakeReporter struct {
 	reports []upstream.PortReport
 	deletes []upstream.PortReport
-	err     error
+	// reportAttempts counts every ReportPorts call, including ones that return err, so
+	// tests can assert a report was (or was not) re-attempted independently of success.
+	reportAttempts int
+	err            error
 }
 
 func (f *fakeReporter) ReportPorts(_ context.Context, report upstream.PortReport) error {
+	f.reportAttempts++
 	if f.err != nil {
 		return f.err
 	}

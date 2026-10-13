@@ -24,6 +24,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -67,6 +69,37 @@ type PortReport struct {
 	// AdditionalPorts is the set of user-declared ports from
 	// spec.filter.additionalPortList, reported alongside the discovered ports.
 	AdditionalPorts []Port `json:"additionalPorts,omitempty"`
+}
+
+// ErrIncompleteReport indicates a report is missing a field the upstream requires
+// on every POST and DELETE. The upstream cannot act on a report that lacks the IPAM
+// credential or any load balancer address, so such a report is not sent.
+var ErrIncompleteReport = errors.New("incomplete port report")
+
+// ErrUpstreamRejected indicates the upstream refused a report with a 4xx client
+// error. Unlike a transient failure (connectivity, 5xx), the request will not
+// succeed if retried unchanged, so the controller treats it as terminal: it surfaces
+// the rejection and stops retrying on the timer, re-attempting only when the policy
+// or its target Service changes.
+var ErrUpstreamRejected = errors.New("upstream rejected port report")
+
+// Validate reports whether the payload carries the fields the upstream requires on
+// every report and withdrawal: a resolved IPAM credential (IpamSecret) and at least
+// one load balancer address (an IPv4 or IPv6 entry). It returns an error wrapping
+// ErrIncompleteReport that names the missing fields, or nil when the report is
+// complete. The error message never includes the credential value itself.
+func (r PortReport) Validate() error {
+	var missing []string
+	if r.IpamSecret == "" {
+		missing = append(missing, "ipamSecret")
+	}
+	if len(r.IPv4Addresses) == 0 && len(r.IPv6Addresses) == 0 {
+		missing = append(missing, "ipAddresses")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: missing %s", ErrIncompleteReport, strings.Join(missing, ", "))
 }
 
 // IdempotencyKey returns a stable identifier for the dedupe-relevant content of

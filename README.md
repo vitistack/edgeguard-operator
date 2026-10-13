@@ -132,17 +132,22 @@ The operator maintains three conditions on `.status.conditions`:
 
 | Condition | Reason | Meaning |
 |-----------|--------|---------|
-| **Ready** | `ServiceProtected` | Finalizer present; Service is managed. |
+| **Ready** | `ServiceProtected` | Finalizer present; Service is managed and (if reporting is enabled) the last report was accepted upstream. |
 | | `ServiceNotFound` | Target Service does not exist (yet). |
 | | `ServiceTerminating` | Target Service is being deleted. |
 | | `ServiceNotLoadBalancer` | Target Service is not of type `LoadBalancer`. |
+| | `UpstreamReportIncomplete` | A required report field (the IPAM credential and/or a load balancer address) is missing, so the report was not sent — not ready until it resolves. |
+| | `UpstreamReportFailed` | The last upstream report failed transiently (connectivity, or a 5xx); a retry is pending. |
+| | `UpstreamReportRejected` | The upstream refused the report with a 4xx; treated as terminal — not retried on the timer, and the identical payload is suppressed until the report content changes. |
 | **IpamSecretReady** | `SecretResolved` | Credential resolved successfully. |
 | | `SecretNotFound` | Referenced Secret does not exist (tolerated — empty credential). |
 | | `SecretInvalid` | Secret exists but has no `secret` key (tolerated). |
 | | `SecretNotConfigured` | Service has no `ipam.vitistack.io/secret` annotation. |
 | **UpstreamReady** | *(absent)* | Healthy — reporting succeeded, or is intentionally disabled. |
 | | `UpstreamNotConfigured` | `filter.enable` is set but no `UPSTREAM_API_URL` is configured. |
-| | `UpstreamReportFailed` | Configured, but the last report failed; a retry is pending. |
+| | `UpstreamReportIncomplete` | The report is missing a field the upstream requires — the IPAM credential (`ipamSecret`) and/or a load balancer address — so it was **not** sent. Clears once the credential resolves and the Service has an ingress IP. |
+| | `UpstreamReportFailed` | Configured, but the last report failed **transiently** (connectivity, or a `5xx`); a retry is pending. |
+| | `UpstreamReportRejected` | The upstream refused the report with a **`4xx`** client error. Treated as **terminal**: the operator stops retrying on the timer and suppresses the identical payload (remembered via `.status.rejectedReportKey`), re-attempting only when the report content changes. |
 
 ---
 
@@ -164,7 +169,9 @@ The manager is configured with environment variables (each also has an equivalen
 | `UPSTREAM_API_URL` set | Real HTTP `POST` / `DELETE` | *(absent — healthy)* |
 | Neither set (with `filter.enable: true`) | Report skipped | `UpstreamNotConfigured` |
 
-> Transient failures (DNS, connectivity, 5xx) are **soft**: they are logged at `INFO`, surfaced as `UpstreamReportFailed`, and requeued for retry — not raised as a hard reconcile error. Observed ports are not persisted on failure, so the retry re-sends the same payload.
+> **Transient** failures (DNS, connectivity, `5xx`) are **soft**: they are logged at `INFO`, surfaced as `UpstreamReportFailed` (which also drives `Ready=False`), and requeued for retry on a timer — not raised as a hard reconcile error. Observed ports are not persisted on failure, so the retry re-sends the same payload.
+>
+> A **`4xx`** response is treated as **terminal** (`UpstreamReportRejected`, also `Ready=False`): retrying the same payload will not help, so the operator does **not** requeue on the timer. It also **remembers the rejected report** (by its `Idempotency-Key`) on `.status.rejectedReportKey` and **suppresses re-sending that identical payload** on subsequent reconciles and Service events — it re-attempts only once the report content actually changes (which yields a different key), or clears the memory when a report is accepted. During deletion, a `4xx` on the withdrawal is skipped rather than retried, so a rejected withdrawal never blocks the object from deleting.
 
 ---
 
@@ -200,6 +207,10 @@ Idempotency-Key: <sha256 hash>
 - `observedPorts` are the ports discovered on the target Service (TCP/UDP/SCTP).
 - `additionalPorts` are the user-declared ports from `spec.filter.additionalPortList`.
 - The `DELETE` payload is reconstructed from the policy's last observed status plus the datacenter and additional ports, and **carries the IPAM credential** (`ipamSecret`) — the upstream requires it to authorize the withdrawal. It is resolved best-effort from the target Service's annotations; if the Service is already gone, `ipamSecret` and `ipamZone` are omitted.
+
+> ⚠️ **Required fields.** Every `POST` and `DELETE` must carry the IPAM credential (`ipamSecret`) **and** at least one load balancer address (`ipv4Addresses` or `ipv6Addresses`). If either is missing the operator does **not** send the request:
+> - For a `POST`, the policy is marked `UpstreamReady=False/UpstreamReportIncomplete` (and `Ready=False` for the same reason) and the report is retried (observed ports are not persisted) until the credential resolves and the Service has an ingress IP.
+> - For a `DELETE`, an incomplete withdrawal is skipped rather than sent — so a policy whose credential can no longer be resolved is never blocked from deleting.
 
 ### 🔑 The `Idempotency-Key` header
 

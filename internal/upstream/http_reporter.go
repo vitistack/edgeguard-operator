@@ -79,7 +79,7 @@ func (h *HTTPReporter) Configured() bool {
 }
 
 // ReportPorts implements Reporter by POSTing the report as JSON to
-// <BaseURL>/v1/port-reports.
+// <BaseURL>.
 //
 // TODO(user): This is scaffolding. Validate the endpoint path, auth, and
 // response handling against the real upstream service before relying on it.
@@ -88,7 +88,7 @@ func (h *HTTPReporter) ReportPorts(ctx context.Context, report PortReport) error
 }
 
 // DeletePorts implements Reporter by sending an HTTP DELETE with the report body
-// to <BaseURL>/v1/port-reports, withdrawing a previously reported port set when the
+// to <BaseURL>, withdrawing a previously reported port set when the
 // policy or its target Service is removed.
 func (h *HTTPReporter) DeletePorts(ctx context.Context, report PortReport) error {
 	return h.send(ctx, http.MethodDelete, report)
@@ -107,7 +107,7 @@ func (h *HTTPReporter) send(ctx context.Context, method string, report PortRepor
 	}
 
 	// TODO(user): confirm the real endpoint path and method.
-	endpoint := h.BaseURL + "/v1/port-reports"
+	endpoint := h.BaseURL
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("building upstream request: %w", err)
@@ -129,11 +129,18 @@ func (h *HTTPReporter) send(ctx context.Context, method string, report PortRepor
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// TODO(user): map upstream status codes to retryable vs. terminal errors.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("upstream rejected port report: status %d", resp.StatusCode)
+	// Any 2xx status counts as the report being accepted. A 4xx is a client error:
+	// the upstream refused the request and it will not succeed if retried unchanged,
+	// so it is reported as the terminal ErrUpstreamRejected. Anything else (5xx,
+	// redirects, ...) is a transient failure the controller surfaces and retries.
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return nil
+	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		return fmt.Errorf("%w: status %d", ErrUpstreamRejected, resp.StatusCode)
+	default:
+		return fmt.Errorf("upstream returned unexpected status %d", resp.StatusCode)
 	}
-	return nil
 }
 
 // Ensure HTTPReporter satisfies the interface at compile time.

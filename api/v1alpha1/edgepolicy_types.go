@@ -155,6 +155,14 @@ type EdgePolicyStatus struct {
 	// +kubebuilder:validation:items:MaxLength=45
 	ObservedIPs []string `json:"observedIPs,omitempty"`
 
+	// RejectedReportKey is the idempotency key of the last report the upstream
+	// rejected with a 4xx. While it matches the key of the report the controller
+	// would send next, that (unchanged) report is suppressed instead of re-attempted;
+	// it is cleared once the report content changes or a report is accepted.
+	// +optional
+	// +kubebuilder:validation:MaxLength=64
+	RejectedReportKey string `json:"rejectedReportKey,omitempty"`
+
 	// Conditions represent the current status of the edge policy.
 	// +optional
 	// +listType=map
