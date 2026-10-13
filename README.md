@@ -3,7 +3,7 @@
 > A Kubernetes operator that guards LoadBalancer Services at the edge — discovering their ports and ingress IPs, protecting them with finalizers, and reporting them to an upstream IPAM / edge API.
 
 <p>
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.27.2+-00ADD8?logo=go&logoColor=white">
   <img alt="Kubernetes" src="https://img.shields.io/badge/Kubernetes-1.31+-326CE5?logo=kubernetes&logoColor=white">
   <img alt="Kubebuilder" src="https://img.shields.io/badge/built%20with-Kubebuilder-326CE5?logo=kubernetes&logoColor=white">
   <img alt="API" src="https://img.shields.io/badge/API-security.vitistack.io%2Fv1alpha1-blue">
