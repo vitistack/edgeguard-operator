@@ -14,12 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -36,21 +36,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
-      - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+      - name: Build golangci-lint
+        run: make golangci-lint
 
       - name: Run gosec
-        # Scope to the operator's own code (cmd/api/internal). The e2e helpers
-        # under test/ intentionally launch subprocesses and read/write manifests
-        # and are already annotated with //nolint:gosec, which standalone gosec
-        # does not honor.
-        run: gosec -exclude-generated -exclude-dir=test ./...
+        # gosec is run via golangci-lint rather than the standalone binary: the
+        # standalone gosec release lags the Go toolchain and cannot decode the
+        # newer export-data format (fails with "export data version N greater
+        # than maximum supported"), whereas golangci-lint bundles a current
+        # x/tools. Scope to the operator's own code (cmd/api/internal); the e2e
+        # helpers under test/ intentionally launch subprocesses and read/write
+        # manifests. golangci-lint honors //nolint:gosec directives.
+        run: bin/golangci-lint run --default=none --enable=gosec ./cmd/... ./api/... ./internal/...

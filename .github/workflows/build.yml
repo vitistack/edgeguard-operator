@@ -1,0 +1,22 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  docker-build:
+    permissions:
+      contents: read
+    name: Build container image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build container image
+        run: make docker-build IMG=edgeguard-operator:${{ github.sha }}
