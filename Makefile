@@ -317,7 +317,7 @@ HELM_NAMESPACE ?= edgeguard-operator-system
 ## Name of the Helm release
 HELM_RELEASE ?= edgeguard-operator
 ## Path to the Helm chart directory
-HELM_CHART_DIR ?= dist/chart
+HELM_CHART_DIR ?= chart/edgeguard-operator
 ## Additional arguments to pass to helm commands
 HELM_EXTRA_ARGS ?=
 
