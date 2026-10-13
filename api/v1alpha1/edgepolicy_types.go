@@ -37,11 +37,11 @@ type EdgePolicySpec struct {
 	// +optional
 	Filter *FilterSpec `json:"filter,omitempty"`
 
-	// Datacenter is the availability zone this policy belongs to. When set, it is
-	// included in the upstream port report.
-	// +optional
+	// Datacenter is the availability zone this policy belongs to. It is included
+	// in the upstream port report.
+	// +required
 	// +kubebuilder:validation:Enum=no-east-az1;no-east-az2;no-central-az1;no-central-az2;no-west-az1;no-west-az2;no-north-az1;no-north-az2
-	Datacenter string `json:"datacenter,omitempty"`
+	Datacenter string `json:"datacenter"`
 
 	// Geographic region policy with optional additional allowed IP ranges.
 	// +optional

@@ -41,6 +41,8 @@ const kindService = "Service"
 const (
 	dcServiceName     = "dc-service"
 	deleteServiceName = "delete-service"
+	// dcEast is a representative datacenter value reused across fixtures (goconst).
+	dcEast = "no-east-az1"
 )
 
 var _ = Describe("EdgePolicy Controller", func() {
@@ -66,6 +68,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 					Name:      resourceName,
 					Namespace: resourceNamespace,
 					Spec: securityv1alpha1.EdgePolicySpec{
+						Datacenter: dcEast,
 						TargetRef: securityv1alpha1.TargetReference{
 							APIVersion: "v1",
 							Kind:       kindService,
@@ -140,6 +143,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 				Name:      policyName,
 				Namespace: namespace,
 				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
 					TargetRef: securityv1alpha1.TargetReference{
 						APIVersion: "v1",
 						Kind:       kindService,
@@ -240,6 +244,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 				Name:      policyName,
 				Namespace: namespace,
 				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
 					TargetRef: securityv1alpha1.TargetReference{
 						APIVersion: "v1",
 						Kind:       kindService,
@@ -356,7 +361,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       dcServiceName,
 					},
-					Datacenter: "no-east-az1",
+					Datacenter: dcEast,
 					Filter: &securityv1alpha1.FilterSpec{
 						Enable: true,
 						AdditionalPortList: []securityv1alpha1.AdditionalPort{
@@ -407,7 +412,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 			By("confirming the report carries the datacenter and additional ports")
 			Expect(reporter.reports).To(HaveLen(1))
 			report := reporter.reports[0]
-			Expect(report.Datacenter).To(Equal("no-east-az1"))
+			Expect(report.Datacenter).To(Equal(dcEast))
 			Expect(report.ObservedPorts).To(HaveLen(1))
 			Expect(report.AdditionalPorts).To(HaveLen(2))
 			Expect(report.AdditionalPorts[0].Protocol).To(Equal("ICMP"))
@@ -508,6 +513,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 				Name:      policyName,
 				Namespace: namespace,
 				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
 					TargetRef: securityv1alpha1.TargetReference{
 						APIVersion: "v1",
 						Kind:       kindService,
@@ -591,6 +597,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 				Name:      policyName,
 				Namespace: namespace,
 				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
 					TargetRef: securityv1alpha1.TargetReference{
 						APIVersion: "v1",
 						Kind:       kindService,
@@ -676,6 +683,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 				Name:      policyName,
 				Namespace: namespace,
 				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
 					TargetRef: securityv1alpha1.TargetReference{
 						APIVersion: "v1",
 						Kind:       kindService,
@@ -759,6 +767,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 				Name:      policyName,
 				Namespace: namespace,
 				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
 					TargetRef: securityv1alpha1.TargetReference{
 						APIVersion: "v1",
 						Kind:       kindService,
@@ -853,6 +862,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 				Name:      policyName,
 				Namespace: namespace,
 				Spec: securityv1alpha1.EdgePolicySpec{
+					Datacenter: dcEast,
 					TargetRef: securityv1alpha1.TargetReference{
 						APIVersion: "v1",
 						Kind:       kindService,

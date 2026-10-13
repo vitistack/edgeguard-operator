@@ -64,7 +64,7 @@ flowchart LR
 | `targetRef.name` | string | ✅ | Name of the target Service, in the **same namespace** as the policy. |
 | `filter.enable` | bool | ⬜ | Enables service port discovery **and** upstream reporting. Defaults to `false` when omitted. |
 | `filter.additionalPortList` | []AdditionalPort | ⬜ | Extra user-declared ports reported upstream alongside the discovered Service ports (max 256). |
-| `datacenter` | enum | ⬜ | Availability zone the policy belongs to, reported upstream. One of `no-east-az1`, `no-east-az2`, `no-central-az1`, `no-central-az2`, `no-west-az1`, `no-west-az2`, `no-north-az1`, `no-north-az2`. |
+| `datacenter` | enum | ✅ | Availability zone the policy belongs to, reported upstream. One of `no-east-az1`, `no-east-az2`, `no-central-az1`, `no-central-az2`, `no-west-az1`, `no-west-az2`, `no-north-az1`, `no-north-az2`. |
 | `allowedRegion.region` | enum | ⬜ | One of `norway`, `nordics`, `europe`. |
 | `allowedRegion.additionalAllowList` | []CIDR | ⬜ | Extra IPv4/IPv6 CIDRs allowed regardless of region (max 256). |
 

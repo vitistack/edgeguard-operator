@@ -64,7 +64,10 @@ manager:
   ##
   caBundle:
     ## Set to true to mount the CA bundle ConfigMap into the manager container.
-    enabled: true
+    ## Keep this false unless the ConfigMap below already exists in the release
+    ## namespace — otherwise the manager pod cannot start (it blocks waiting for
+    ## the volume to mount).
+    enabled: false
     ## Name of the ConfigMap holding the CA bundle.
     configMapName: nhn-certbundle
     ## Key within the ConfigMap, also used as the mounted file name (subPath).

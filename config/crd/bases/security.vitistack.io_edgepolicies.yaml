@@ -91,8 +91,8 @@ spec:
                 type: object
               datacenter:
                 description: |-
-                  Datacenter is the availability zone this policy belongs to. When set, it is
-                  included in the upstream port report.
+                  Datacenter is the availability zone this policy belongs to. It is included
+                  in the upstream port report.
                 enum:
                 - no-east-az1
                 - no-east-az2
@@ -178,6 +178,7 @@ spec:
                 - name
                 type: object
             required:
+            - datacenter
             - targetRef
             type: object
             x-kubernetes-validations:
