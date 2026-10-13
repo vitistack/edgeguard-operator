@@ -464,8 +464,11 @@ func (r *EdgePolicyReconciler) deactivatePolicy(ctx context.Context, policy *sec
 // deletePortsUpstream withdraws a policy's previously reported ports from the
 // upstream system when the policy or its target Service is removed. The report is
 // reconstructed from the policy status (last observed ports and IPs) plus the
-// datacenter and declared additional ports from the spec. It is a no-op unless the
-// policy enables filter reporting and the Reporter is configured.
+// datacenter and declared additional ports from the spec. The upstream requires the
+// IPAM credential on the withdrawal too, so it is resolved best-effort from the
+// target Service's ipam.vitistack.io/secret annotation; when the Service is already
+// gone the credential (and zone) are simply omitted. It is a no-op unless the policy
+// enables filter reporting and the Reporter is configured.
 func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
 	policy *securityv1alpha1.EdgePolicy, serviceName string) error {
 	if !filterEnabled(policy) || !reporterConfigured(r.Reporter) || r.Reporter == nil {
@@ -477,6 +480,8 @@ func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
 		return fmt.Errorf("resolving cluster ID: %w", err)
 	}
 
+	ipamSecret, ipamZone := r.ipamCredentialForDelete(ctx, policy.Namespace, serviceName)
+
 	ipv4, ipv6 := splitIPFamilies(policy.Status.ObservedIPs)
 	report := upstream.PortReport{
 		ClusterID:             clusterID,
@@ -484,6 +489,8 @@ func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
 		EdgePolicyID:          string(policy.UID),
 		ServiceName:           serviceName,
 		Datacenter:            policy.Spec.Datacenter,
+		IpamZone:              ipamZone,
+		IpamSecret:            ipamSecret,
 		IPv4Addresses:         ipv4,
 		IPv6Addresses:         ipv6,
 		ObservedPorts:         make([]upstream.Port, 0, len(policy.Status.ObservedPorts)),
@@ -502,6 +509,29 @@ func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
 	logf.FromContext(ctx).Info("Withdrew ports upstream",
 		"edgepolicy", policy.Name, "service", serviceName)
 	return nil
+}
+
+// ipamCredentialForDelete resolves the IPAM credential and zone for a withdrawal
+// payload from the target Service's annotations. Withdrawal runs while the Service
+// may already be deleting or gone, so every failure (a missing Service, an
+// unresolvable Secret, an API error) is soft: it yields empty values and a V(1) log
+// rather than blocking the withdraw. The credential is never logged.
+func (r *EdgePolicyReconciler) ipamCredentialForDelete(
+	ctx context.Context, namespace, serviceName string) (secret, zone string) {
+	var service corev1.Service
+	key := types.NamespacedName{Namespace: namespace, Name: serviceName}
+	if err := r.Get(ctx, key, &service); err != nil {
+		logf.FromContext(ctx).V(1).Info("Could not read target Service for withdrawal credential",
+			"service", serviceName, "error", err.Error())
+		return "", ""
+	}
+	value, _, err := r.resolveIpamSecret(ctx, &service)
+	if err != nil {
+		logf.FromContext(ctx).V(1).Info("Could not resolve IPAM credential for withdrawal",
+			"service", serviceName, "error", err.Error())
+		return "", service.Annotations[zoneAnnotation]
+	}
+	return value, service.Annotations[zoneAnnotation]
 }
 
 // clusterUID returns the UID of the kube-system namespace, used as a stable

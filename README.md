@@ -199,7 +199,7 @@ Idempotency-Key: <sha256 hash>
 
 - `observedPorts` are the ports discovered on the target Service (TCP/UDP/SCTP).
 - `additionalPorts` are the user-declared ports from `spec.filter.additionalPortList`.
-- The `DELETE` payload is reconstructed from the policy's last observed status plus the datacenter and additional ports; it does **not** carry the IPAM credential.
+- The `DELETE` payload is reconstructed from the policy's last observed status plus the datacenter and additional ports, and **carries the IPAM credential** (`ipamSecret`) — the upstream requires it to authorize the withdrawal. It is resolved best-effort from the target Service's annotations; if the Service is already gone, `ipamSecret` and `ipamZone` are omitted.
 
 ### 🔑 The `Idempotency-Key` header
 

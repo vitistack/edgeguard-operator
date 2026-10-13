@@ -448,6 +448,10 @@ var _ = Describe("EdgePolicy Controller", func() {
 			service := &corev1.Service{
 				Name:      deleteServiceName,
 				Namespace: namespace,
+				Annotations: map[string]string{
+					"ipam.vitistack.io/secret": "delete-secret",
+					"ipam.vitistack.io/zone":   "oslo-1",
+				},
 				Spec: corev1.ServiceSpec{
 					Type:  corev1.ServiceTypeLoadBalancer,
 					Ports: []corev1.ServicePort{{Port: 443}},
@@ -463,6 +467,17 @@ var _ = Describe("EdgePolicy Controller", func() {
 					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
 					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
 				}
+			})
+
+			By("creating the Secret the target Service references")
+			delSecret := &corev1.Secret{
+				Name:      "delete-secret",
+				Namespace: namespace,
+				Data:      map[string][]byte{"secret": []byte("d3l3te-cr3d")},
+			}
+			Expect(k8sClient.Create(ctx, delSecret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, delSecret)
 			})
 
 			By("reconciling so the policy protects the Service and reports once")
@@ -483,6 +498,10 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(del.ServiceName).To(Equal(deleteServiceName))
 			Expect(del.Datacenter).To(Equal("no-west-az2"))
 			Expect(del.ObservedPorts).To(HaveLen(1))
+
+			By("confirming the withdraw carries the resolved IPAM credential")
+			Expect(del.IpamSecret).To(Equal("d3l3te-cr3d"))
+			Expect(del.IpamZone).To(Equal("oslo-1"))
 
 			By("confirming the policy finalizer was released so the object is gone")
 			Expect(errors.IsNotFound(k8sClient.Get(ctx, delPolicyKey, &securityv1alpha1.EdgePolicy{}))).To(BeTrue())
