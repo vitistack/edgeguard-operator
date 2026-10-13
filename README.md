@@ -164,7 +164,7 @@ Idempotency-Key: <sha256 hash>
 {
   "clusterID": "<UID of the kube-system namespace>",
   "serviceName": "my-service",
-  "ipamZone": "oslo-1",
+  "ipamZone": "inet",
   "ipamSecret": "<resolved credential>",
   "ipv4Addresses": ["203.0.113.10"],
   "ipv6Addresses": ["2001:db8::10"],
@@ -189,7 +189,7 @@ Every report carries an **`Idempotency-Key`** HTTP header so the upstream can sa
 ## 🚀 Getting Started
 
 ### Prerequisites
-- Go **v1.24.6+**
+- Go **v1.27.2+**
 - Docker **17.03+**
 - kubectl **v1.31+**
 - Access to a Kubernetes **v1.31+** cluster — required because the API contract uses **CEL validation rules** (`x-kubernetes-validations`), which need CRD validation expressions that are GA from Kubernetes 1.31.
