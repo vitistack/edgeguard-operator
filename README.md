@@ -183,7 +183,7 @@ Idempotency-Key: <sha256 hash>
 
 ```json
 {
-  "clusterID": "<UID of the kube-system namespace>",
+  "clusterId": "<UID of the kube-system namespace>",
   "edgePolicyNamespaceId": "<UID of the policy's namespace>",
   "edgePolicyId": "<UID of the EdgePolicy object>",
   "serviceName": "my-service",
@@ -206,7 +206,7 @@ Idempotency-Key: <sha256 hash>
 Every report carries an **`Idempotency-Key`** HTTP header so the upstream can safely deduplicate retries and duplicates:
 
 - The key is a **SHA-256 hash** derived only from the **dedupe-relevant content**: the service name, the datacenter, the discovered ports, the additional ports, and the load balancer IPs.
-- Fields that don't change the *meaning* of the report — `clusterID`, `edgePolicyNamespaceId`, `edgePolicyId`, `ipamZone`, and `ipamSecret` — are **deliberately excluded**. Rotating a credential alone will not defeat deduplication.
+- Fields that don't change the *meaning* of the report — `clusterId`, `edgePolicyNamespaceId`, `edgePolicyId`, `ipamZone`, and `ipamSecret` — are **deliberately excluded**. Rotating a credential alone will not defeat deduplication.
 - Two reports describing the same content produce the **same key**, so an upstream that honors the header can treat a retried or duplicate request (e.g. one re-sent after a reconcile conflict or a transient failure) as the **same request** and ignore it.
 
 > The operator uses report-before-persist ordering: it sends upstream *before* writing `.status.observedPorts`. In the rare crash window between a successful POST and the status write, the same report may be sent again on restart — the `Idempotency-Key` is what makes that safe. **The upstream must honor the header for exactly-once semantics.**

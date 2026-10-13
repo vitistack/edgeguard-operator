@@ -42,7 +42,7 @@ type Port struct {
 type PortReport struct {
 	// ClusterID is the UID of the kube-system namespace, used as a stable
 	// cluster identifier.
-	ClusterID string `json:"clusterID,omitempty"`
+	ClusterID string `json:"clusterId,omitempty"`
 	// EdgePolicyNamespaceID is the UID of the namespace the EdgePolicy lives in.
 	EdgePolicyNamespaceID string `json:"edgePolicyNamespaceId,omitempty"`
 	// EdgePolicyID is the UID of the EdgePolicy object the report describes.
