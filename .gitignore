@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# Build output and tool binaries installed locally by the Makefile (controller-gen,
+# golangci-lint, kustomize, setup-envtest, envtest K8s assets, the compiled manager, ...)
+bin/
+
 # Test binary, built with `go test -c`
 *.test
 
