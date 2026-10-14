@@ -16,6 +16,8 @@
 
 `edgeguard-operator` introduces a single Custom Resource — **`EdgePolicy`** — that attaches a security and discovery policy to a Kubernetes `Service` of type `LoadBalancer` in the same namespace.
 
+Its purpose is to **stop unwanted traffic at the very tip of the edge — as it enters the datacenter** — rather than after it has already reached the workloads inside. By discovering each guarded Service's ports and ingress IPs and reporting them upstream, the operator lets the edge enforce what should be allowed in before traffic crosses the datacenter boundary.
+
 For each `EdgePolicy` the operator:
 
 - 🔗 **Protects the target Service** with a finalizer, so the policy can react before the Service is deleted.
