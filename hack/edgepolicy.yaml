@@ -5,7 +5,7 @@ metadata:
 spec:
   datacenter: no-east-az1
   filter:
-    enable: true
+    enabled: true
     additionalPortList:
       - name: ping
         port: 0
@@ -13,9 +13,10 @@ spec:
       - name: custom-app
         port: 8100
         protocol: TCP
-  allowedRegion:
+  ddos:
+    enabled: true
     region: nordics
-    additionalAllowList:
+    additionalCidrList:
       - 192.168.10.0/24
       - 2001:db8:1234::/48
   targetRef:

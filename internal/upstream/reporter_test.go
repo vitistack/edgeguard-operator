@@ -32,7 +32,7 @@ const (
 func baseReport() PortReport {
 	return PortReport{
 		ServiceName:   "my-service",
-		ObservedPorts: []Port{{Name: portHTTP, Port: 80, Protocol: protoTCP}},
+		Filter:        FilterReport{Enabled: true, ObservedPorts: []Port{{Name: portHTTP, Port: 80, Protocol: protoTCP}}},
 		IPv4Addresses: []string{"203.0.113.10"},
 		IPv6Addresses: []string{"2001:db8::10"},
 	}
@@ -61,17 +61,24 @@ func TestIdempotencyKeyChangesWithDedupeFields(t *testing.T) {
 	cases := map[string]func(*PortReport){
 		"service name": func(r *PortReport) { r.ServiceName = "other-service" },
 		"port added": func(r *PortReport) {
-			r.ObservedPorts = append(r.ObservedPorts, Port{Name: "https", Port: 443, Protocol: protoTCP})
+			r.Filter.ObservedPorts = append(r.Filter.ObservedPorts, Port{Name: "https", Port: 443, Protocol: protoTCP})
 		},
 		"port number": func(r *PortReport) {
-			r.ObservedPorts = []Port{{Name: portHTTP, Port: 8080, Protocol: protoTCP}}
+			r.Filter.ObservedPorts = []Port{{Name: portHTTP, Port: 8080, Protocol: protoTCP}}
 		},
-		"protocol":   func(r *PortReport) { r.ObservedPorts = []Port{{Name: portHTTP, Port: 80, Protocol: "UDP"}} },
-		"ipv4":       func(r *PortReport) { r.IPv4Addresses = []string{"203.0.113.11"} },
-		"ipv6":       func(r *PortReport) { r.IPv6Addresses = nil },
-		"datacenter": func(r *PortReport) { r.Datacenter = "no-east-az1" },
+		"protocol":               func(r *PortReport) { r.Filter.ObservedPorts = []Port{{Name: portHTTP, Port: 80, Protocol: "UDP"}} },
+		"ipv4":                   func(r *PortReport) { r.IPv4Addresses = []string{"203.0.113.11"} },
+		"ipv6":                   func(r *PortReport) { r.IPv6Addresses = nil },
+		"datacenter":             func(r *PortReport) { r.Datacenter = "no-east-az1" },
+		"filter enabled toggled": func(r *PortReport) { r.Filter.Enabled = !r.Filter.Enabled },
 		"additional port added": func(r *PortReport) {
-			r.AdditionalPorts = append(r.AdditionalPorts, Port{Name: "ping", Port: 0, Protocol: "ICMP"})
+			r.Filter.AdditionalPorts = append(r.Filter.AdditionalPorts, Port{Name: "ping", Port: 0, Protocol: "ICMP"})
+		},
+		"ddos added":            func(r *PortReport) { r.DDoS = &DDoSReport{Enabled: true} },
+		"ddos present disabled": func(r *PortReport) { r.DDoS = &DDoSReport{Enabled: false} },
+		"ddos region":           func(r *PortReport) { r.DDoS = &DDoSReport{Enabled: true, Region: "nordics"} },
+		"ddos cidr list added": func(r *PortReport) {
+			r.DDoS = &DDoSReport{Enabled: true, AdditionalCidrList: []string{"192.0.2.0/24"}}
 		},
 	}
 

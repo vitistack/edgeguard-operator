@@ -34,7 +34,7 @@ manager:
   ## Used to configure upstream port reporting (see the project README).
   ##   - UPSTREAM_API_URL: base URL of the upstream IPAM API that receives
   ##     port reports. Leave unset to disable reporting; policies with
-  ##     filter.enable: true then report UpstreamReady=False/UpstreamNotConfigured.
+  ##     filter.enabled: true then report UpstreamReady=False/UpstreamNotConfigured.
   ##   - UPSTREAM_REPORTING_DISABLED: set to "true" to treat every report as
   ##     delivered without any outbound call (takes precedence over the URL).
   ##   - UPSTREAM_INSECURE_SKIP_VERIFY: set to "true" to skip upstream TLS

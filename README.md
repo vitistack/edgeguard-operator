@@ -22,8 +22,8 @@ For each `EdgePolicy` the operator:
 
 - 🔗 **Protects the target Service** with a finalizer, so the policy can react before the Service is deleted.
 - 🔎 **Discovers** the Service's ports and load balancer ingress IPs (split into IPv4 / IPv6).
-- 📡 **Reports** the discovered state to an external upstream API (opt-in via `spec.filter.enable`), enriched with the datacenter, any user-declared additional ports, an IPAM zone, and a credential resolved from a Kubernetes `Secret`. When a policy or its Service is removed, the operator **withdraws** the report with an HTTP `DELETE`.
-- 🌍 **Declares an allowed region** policy (`norway` / `nordics` / `europe`) plus optional extra CIDR allowances.
+- 📡 **Reports** the discovered state to an external upstream API (whenever `spec.filter` or `spec.ddos` is set — `filter.enabled` is carried in the payload to signal whether discovery is on), enriched with the datacenter, any user-declared additional ports, an IPAM zone, and a credential resolved from a Kubernetes `Secret`. When a policy or its Service is removed, the operator **withdraws** the report with an HTTP `DELETE`.
+- 🌍 **Declares a DDoS region policy** (`norway` / `nordics` / `europe`) plus optional extra CIDR allowances, reported upstream.
 - 🧭 **Surfaces everything on `.status`** as standard `metav1.Condition`s, visible with `kubectl get edgepolicies`.
 
 Reconciliation is **idempotent** and tolerant: missing Secrets, missing upstream configuration, and transient upstream outages are surfaced on the status rather than crashing the reconcile loop.
@@ -43,12 +43,12 @@ flowchart LR
     SVC --> OP
     SEC --> OP
     OP -- finalizer + status --> EP
-    OP -- "POST/DELETE  (if filter.enable=true)" --> UP[(Upstream IPAM API<br/>vitistack/ipam-operator)]
+    OP -- "POST/DELETE  (if spec.filter or spec.ddos is set)" --> UP[(Upstream IPAM API<br/>vitistack/ipam-operator)]
 ```
 
 1. An `EdgePolicy` references a `Service` by name via `spec.targetRef`.
 2. The operator adds a finalizer to the Service and reads its ports and ingress IPs.
-3. If `spec.filter.enable` is set, it resolves the IPAM credential + zone and **POSTs a port report** upstream; when the policy or its Service goes away it sends a **`DELETE`** to withdraw it.
+3. If `spec.filter` or `spec.ddos` is set, it resolves the IPAM credential + zone and **POSTs a port report** upstream (carrying `filter.enabled` to reflect whether discovery is on); when the policy or its Service goes away it sends a **`DELETE`** to withdraw it.
 4. The policy `.status` reflects the outcome through the `Ready`, `IpamSecretReady`, and `UpstreamReady` conditions.
 
 ---
@@ -64,11 +64,12 @@ flowchart LR
 | `targetRef.apiVersion` | string (`v1`) | ✅ | API version of the target. Only `v1` is supported. |
 | `targetRef.kind` | string (`Service`) | ✅ | Target kind. Only `Service` is supported. |
 | `targetRef.name` | string | ✅ | Name of the target Service, in the **same namespace** as the policy. |
-| `filter.enable` | bool | ⬜ | Enables service port discovery **and** upstream reporting. Defaults to `false` when omitted. |
+| `filter.enabled` | bool | ⬜ | Whether service port discovery is on. Reflected in the upstream report's `filter.enabled`. Defaults to `false` when omitted. Note: it is the presence of the `filter` block (not this flag) that drives upstream reporting — a report is still sent with `enabled: false` so the upstream tracks the current state. |
 | `filter.additionalPortList` | []AdditionalPort | ⬜ | Extra user-declared ports reported upstream alongside the discovered Service ports (max 256). |
 | `datacenter` | enum | ✅ | Availability zone the policy belongs to, reported upstream. One of `no-east-az1`, `no-east-az2`, `no-central-az1`, `no-central-az2`, `no-west-az1`, `no-west-az2`, `no-north-az1`, `no-north-az2`. |
-| `allowedRegion.region` | enum | ⬜ | One of `norway`, `nordics`, `europe`. |
-| `allowedRegion.additionalAllowList` | []CIDR | ⬜ | Extra IPv4/IPv6 CIDRs allowed regardless of region (max 256). |
+| `ddos.enabled` | bool | ⬜ | Whether the DDoS geographic region policy is on. Reflected in the upstream report's `ddos.enabled`. Defaults to `false` when omitted. |
+| `ddos.region` | enum | ⬜ | One of `norway`, `nordics`, `europe`. |
+| `ddos.additionalCidrList` | []CIDR | ⬜ | Extra IPv4/IPv6 CIDRs allowed regardless of region (max 256). |
 
 **`AdditionalPort`** (each entry in `filter.additionalPortList`):
 
@@ -78,7 +79,7 @@ flowchart LR
 | `port` | int32 | ✅ | Port number, `0`–`65535`. |
 | `protocol` | enum | ✅ | One of `TCP`, `UDP`, `ICMP`, `ESP`, `AH`, `SCTP`, `GRE`, `OSPF`, `IGMP`. |
 
-> ℹ️ Validation rule: **at least one** of `filter` or `allowedRegion` must be set.
+> ℹ️ Validation rule: **at least one** of `filter` or `ddos` must be set.
 
 ### Example
 
@@ -95,7 +96,7 @@ spec:
     name: my-service
   datacenter: no-east-az1
   filter:
-    enable: true
+    enabled: true
     additionalPortList:
       - name: ping
         port: 0
@@ -103,16 +104,17 @@ spec:
       - name: custom-app
         port: 8100
         protocol: TCP
-  allowedRegion:
+  ddos:
+    enabled: true
     region: norway
-    additionalAllowList:
+    additionalCidrList:
       - 192.0.2.0/24
       - 2001:db8::/48
 ```
 
 ### Target Service annotations
 
-When `filter.enable` is set, the operator reads these annotations from the **target Service**:
+When `spec.filter` or `spec.ddos` is set, the operator reads these annotations from the **target Service**:
 
 | Annotation | Purpose |
 |------------|---------|
@@ -134,7 +136,7 @@ The operator maintains three conditions on `.status.conditions`:
 
 | Condition | Reason | Meaning |
 |-----------|--------|---------|
-| **Ready** | `ServiceProtected` | Finalizer present; Service is managed and (if reporting is enabled) the last report was accepted upstream. |
+| **Ready** | `ServiceProtected` | Finalizer present; Service is managed and (if `spec.filter` or `spec.ddos` is set) the last report was accepted upstream. |
 | | `ServiceNotFound` | Target Service does not exist (yet). |
 | | `ServiceTerminating` | Target Service is being deleted. |
 | | `ServiceNotLoadBalancer` | Target Service is not of type `LoadBalancer`. |
@@ -146,7 +148,7 @@ The operator maintains three conditions on `.status.conditions`:
 | | `SecretInvalid` | Secret exists but has no `secret` key (tolerated). |
 | | `SecretNotConfigured` | Service has no `ipam.vitistack.io/secret` annotation. |
 | **UpstreamReady** | *(absent)* | Healthy — reporting succeeded, or is intentionally disabled. |
-| | `UpstreamNotConfigured` | `filter.enable` is set but no `UPSTREAM_API_URL` is configured. |
+| | `UpstreamNotConfigured` | `spec.filter` or `spec.ddos` is set but no `UPSTREAM_API_URL` is configured. |
 | | `UpstreamReportIncomplete` | The report is missing a field the upstream requires — the IPAM credential (`ipamSecret`) and/or a load balancer address — so it was **not** sent. Clears once the credential resolves and the Service has an ingress IP. |
 | | `UpstreamReportFailed` | Configured, but the last report failed **transiently** (connectivity, or a `5xx`); a retry is pending. |
 | | `UpstreamReportRejected` | The upstream refused the report with a **`4xx`** client error. Treated as **terminal**: the operator stops retrying on the timer and suppresses the identical payload (remembered via `.status.rejectedReportKey`), re-attempting only when the report content changes. |
@@ -159,7 +161,7 @@ The manager is configured with environment variables (each also has an equivalen
 
 | Env var | Flag | Default | Description |
 |---------|------|---------|-------------|
-| `UPSTREAM_API_URL` | `--upstream-url` | *(empty)* | Base URL of the upstream API that receives port reports, e.g. `https://ipam-api.vitistack.io/v2`. When empty, policies with `filter.enable: true` report `UpstreamReady=False/UpstreamNotConfigured`. |
+| `UPSTREAM_API_URL` | `--upstream-url` | *(empty)* | Base URL of the upstream API that receives port reports, e.g. `https://ipam-api.vitistack.io/v2`. When empty, policies with a `spec.filter` or `spec.ddos` block report `UpstreamReady=False/UpstreamNotConfigured`. |
 | `UPSTREAM_REPORTING_DISABLED` | `--disable-upstream-reporting` | `false` | When truthy (`1`, `t`, `true`, …), upstream reporting is **disabled**: every report is treated as successfully delivered without any outbound call, and no failure condition is raised. **Takes precedence over `UPSTREAM_API_URL`.** |
 | `UPSTREAM_INSECURE_SKIP_VERIFY` | `--upstream-insecure-skip-verify` | `false` | When truthy, **skips upstream TLS certificate verification**. For trusted dev/test mirrors with self-signed certificates only — **do not enable in production**. Prefer mounting a CA bundle (see the Helm chart's `manager.caBundle`). |
 
@@ -169,7 +171,7 @@ The manager is configured with environment variables (each also has an equivalen
 |---------------|----------|-----------------|
 | `UPSTREAM_REPORTING_DISABLED=true` | No-op; reports treated as delivered | *(absent — healthy)* |
 | `UPSTREAM_API_URL` set | Real HTTP `POST` / `DELETE` | *(absent — healthy)* |
-| Neither set (with `filter.enable: true`) | Report skipped | `UpstreamNotConfigured` |
+| Neither set (with `spec.filter` or `spec.ddos` set) | Report skipped | `UpstreamNotConfigured` |
 
 > **Transient** failures (DNS, connectivity, `5xx`) are **soft**: they are logged at `INFO`, surfaced as `UpstreamReportFailed` (which also drives `Ready=False`), and requeued for retry on a timer — not raised as a hard reconcile error. Observed ports are not persisted on failure, so the retry re-sends the same payload.
 >
@@ -179,7 +181,7 @@ The manager is configured with environment variables (each also has an equivalen
 
 ## 📡 Upstream reporting contract
 
-When reporting is enabled and ports/IPs change, the operator sends a report; when the policy or its target Service is removed, it withdraws it:
+When `spec.filter` or `spec.ddos` is set and the report content changes (ports/IPs, the `filter.enabled` flag, or the DDoS region policy), the operator sends a report; when the policy or its target Service is removed, it withdraws it:
 
 ```
 POST   <UPSTREAM_API_URL>     # add / update
@@ -201,13 +203,23 @@ Idempotency-Key: <sha256 hash>
   "ipamSecret": "<resolved credential>",
   "ipv4Addresses": ["203.0.113.10"],
   "ipv6Addresses": ["2001:db8::10"],
-  "observedPorts": [{ "name": "https", "port": 443, "protocol": "TCP" }],
-  "additionalPorts": [{ "name": "ping", "port": 0, "protocol": "ICMP" }]
+  "filter": {
+    "enabled": true,
+    "observedPorts": [{ "name": "https", "port": 443, "protocol": "TCP" }],
+    "additionalPorts": [{ "name": "ping", "port": 0, "protocol": "ICMP" }]
+  },
+  "ddos": {
+    "enabled": true,
+    "region": "norway",
+    "additionalCidrList": ["192.0.2.0/24", "2001:db8::/48"]
+  }
 }
 ```
 
-- `observedPorts` are the ports discovered on the target Service (TCP/UDP/SCTP).
-- `additionalPorts` are the user-declared ports from `spec.filter.additionalPortList`.
+- `filter.enabled` reflects `spec.filter.enabled` (whether discovery is on). It does **not** gate reporting: a report is sent whenever `spec.filter` is present and its content changes, including with `enabled: false`, so the upstream always tracks the current state. It is part of the `Idempotency-Key`, so toggling it produces a fresh report.
+- `filter.observedPorts` are the ports discovered on the target Service (TCP/UDP/SCTP).
+- `filter.additionalPorts` are the user-declared ports from `spec.filter.additionalPortList`, always present and serialized as `[]` when none are declared.
+- `ddos` mirrors `spec.ddos` and is present only when the policy declares a `ddos` block. `ddos.enabled` reflects `spec.ddos.enabled`, `ddos.region` the permitted region (omitted when unset), and `ddos.additionalCidrList` the extra allowed CIDRs — always present and serialized as `[]` when none are declared. The whole `ddos` block is part of the `Idempotency-Key`, so any change to it produces a fresh report.
 - The `DELETE` payload is reconstructed from the policy's last observed status plus the datacenter and additional ports, and **carries the IPAM credential** (`ipamSecret`) — the upstream requires it to authorize the withdrawal. It is resolved best-effort from the target Service's annotations; if the Service is already gone, `ipamSecret` and `ipamZone` are omitted.
 
 > ⚠️ **Required fields.** Every `POST` and `DELETE` must carry the IPAM credential (`ipamSecret`) **and** at least one load balancer address (`ipv4Addresses` or `ipv6Addresses`). If either is missing the operator does **not** send the request:
@@ -218,7 +230,7 @@ Idempotency-Key: <sha256 hash>
 
 Every report carries an **`Idempotency-Key`** HTTP header so the upstream can safely deduplicate retries and duplicates:
 
-- The key is a **SHA-256 hash** derived only from the **dedupe-relevant content**: the service name, the datacenter, the discovered ports, the additional ports, and the load balancer IPs.
+- The key is a **SHA-256 hash** derived only from the **dedupe-relevant content**: the service name, the datacenter, the discovered ports, the additional ports, the DDoS region policy, and the load balancer IPs.
 - Fields that don't change the *meaning* of the report — `clusterId`, `edgePolicyNamespaceId`, `edgePolicyId`, `ipamZone`, and `ipamSecret` — are **deliberately excluded**. Rotating a credential alone will not defeat deduplication.
 - Two reports describing the same content produce the **same key**, so an upstream that honors the header can treat a retried or duplicate request (e.g. one re-sent after a reconcile conflict or a transient failure) as the **same request** and ignore it.
 

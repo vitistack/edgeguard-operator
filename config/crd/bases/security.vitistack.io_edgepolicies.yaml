@@ -63,32 +63,6 @@ spec:
           spec:
             description: spec defines the desired state of EdgePolicy
             properties:
-              allowedRegion:
-                description: Geographic region policy with optional additional allowed
-                  IP ranges.
-                properties:
-                  additionalAllowList:
-                    description: Additional IPv4 or IPv6 CIDR ranges allowed regardless
-                      of geographic region.
-                    items:
-                      maxLength: 43
-                      type: string
-                    maxItems: 256
-                    type: array
-                    x-kubernetes-list-type: set
-                    x-kubernetes-validations:
-                    - message: Each entry must be a valid IPv4 or IPv6 CIDR
-                      rule: self.all(cidr, isCIDR(cidr))
-                  region:
-                    description: Geographic region permitted by the edge policy.
-                    enum:
-                    - norway
-                    - nordics
-                    - europe
-                    type: string
-                required:
-                - region
-                type: object
               datacenter:
                 description: |-
                   Datacenter is the availability zone this policy belongs to. It is included
@@ -103,6 +77,37 @@ spec:
                 - no-north-az1
                 - no-north-az2
                 type: string
+              ddos:
+                description: |-
+                  DDoS configures the DDoS geographic region policy with optional additional
+                  allowed IP ranges.
+                properties:
+                  additionalCidrList:
+                    description: Additional IPv4 or IPv6 CIDR ranges allowed regardless
+                      of geographic region.
+                    items:
+                      maxLength: 43
+                      type: string
+                    maxItems: 256
+                    type: array
+                    x-kubernetes-list-type: set
+                    x-kubernetes-validations:
+                    - message: Each entry must be a valid IPv4 or IPv6 CIDR
+                      rule: self.all(cidr, isCIDR(cidr))
+                  enabled:
+                    default: false
+                    description: |-
+                      Enabled turns on the DDoS geographic region policy. Defaults to false when
+                      omitted.
+                    type: boolean
+                  region:
+                    description: Geographic region permitted by the edge policy.
+                    enum:
+                    - norway
+                    - nordics
+                    - europe
+                    type: string
+                type: object
               filter:
                 description: Filter configures service port discovery and reporting
                   to the upstream system.
@@ -145,10 +150,10 @@ spec:
                     maxItems: 256
                     type: array
                     x-kubernetes-list-type: atomic
-                  enable:
+                  enabled:
                     default: false
                     description: |-
-                      Enable turns on service port discovery and reporting to the upstream system.
+                      Enabled turns on service port discovery and reporting to the upstream system.
                       Defaults to false when omitted.
                     type: boolean
                 type: object
@@ -182,8 +187,8 @@ spec:
             - targetRef
             type: object
             x-kubernetes-validations:
-            - message: At least one of filter or allowedRegion must be specified
-              rule: has(self.filter) || has(self.allowedRegion)
+            - message: At least one of filter or ddos must be specified
+              rule: has(self.filter) || has(self.ddos)
           status:
             description: status defines the observed state of EdgePolicy
             properties:

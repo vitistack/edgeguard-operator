@@ -64,11 +64,42 @@ type PortReport struct {
 	// assigned to the target Service, split by IP family.
 	IPv4Addresses []string `json:"ipv4Addresses,omitempty"`
 	IPv6Addresses []string `json:"ipv6Addresses,omitempty"`
+	// Filter carries the port-discovery state derived from spec.filter: whether
+	// reporting is enabled plus the discovered and user-declared ports.
+	Filter FilterReport `json:"filter"`
+	// DDoS carries the DDoS geographic region policy derived from spec.ddos:
+	// whether it is enabled, the permitted region, and any additional allowed
+	// CIDRs. Omitted from the payload when the policy declares no spec.ddos block.
+	DDoS *DDoSReport `json:"ddos,omitempty"`
+}
+
+// FilterReport mirrors spec.filter in the upstream payload: it reports whether
+// port discovery is enabled alongside the discovered and declared ports.
+type FilterReport struct {
+	// Enabled reflects spec.filter.enabled, i.e. whether the policy opts into
+	// port discovery and reporting.
+	Enabled bool `json:"enabled"`
 	// ObservedPorts is the full, current set of discovered ports (not a delta).
 	ObservedPorts []Port `json:"observedPorts"`
 	// AdditionalPorts is the set of user-declared ports from
 	// spec.filter.additionalPortList, reported alongside the discovered ports.
-	AdditionalPorts []Port `json:"additionalPorts,omitempty"`
+	// Always serialized (as [] when none are declared) so the shape is stable.
+	AdditionalPorts []Port `json:"additionalPorts"`
+}
+
+// DDoSReport mirrors spec.ddos in the upstream payload: it reports whether the
+// DDoS geographic region policy is enabled, the permitted region, and any extra
+// allowed CIDRs.
+type DDoSReport struct {
+	// Enabled reflects spec.ddos.enabled, i.e. whether the policy opts into the
+	// DDoS geographic region policy.
+	Enabled bool `json:"enabled"`
+	// Region is the permitted geographic region from spec.ddos.region, when set.
+	Region string `json:"region,omitempty"`
+	// AdditionalCidrList is the set of extra allowed CIDRs from
+	// spec.ddos.additionalCidrList. Always serialized (as [] when none are
+	// declared) so the shape is stable.
+	AdditionalCidrList []string `json:"additionalCidrList"`
 }
 
 // ErrIncompleteReport indicates a report is missing a field the upstream requires
@@ -104,12 +135,12 @@ func (r PortReport) Validate() error {
 
 // IdempotencyKey returns a stable identifier for the dedupe-relevant content of
 // the report: the target Service plus its discovered ports and load balancer IPs,
-// the datacenter, and the declared additional ports. Two reports with the same
-// such content produce the same key, so an upstream can treat a retry — or a
-// duplicate caused by a reconcile conflict — as the same request and ignore it.
-// Fields that do not change the meaning of the report (credential, zone, cluster
-// ID) are deliberately excluded, so rotating a credential alone does not defeat
-// deduplication.
+// the datacenter, the filter-enabled flag, the declared additional ports, and the
+// DDoS region policy. Two reports with the same such content produce the same key,
+// so an upstream can treat a retry — or a duplicate caused by a reconcile conflict —
+// as the same request and ignore it. Fields that do not change the meaning of the
+// report (credential, zone, cluster ID) are deliberately excluded, so rotating a
+// credential alone does not defeat deduplication.
 func (r PortReport) IdempotencyKey() string {
 	var b strings.Builder
 	b.WriteString(r.ServiceName)
@@ -117,6 +148,8 @@ func (r PortReport) IdempotencyKey() string {
 	// distinct inputs cannot collide by concatenation.
 	b.WriteByte('\n')
 	b.WriteString(r.Datacenter)
+	b.WriteByte('\n')
+	b.WriteString(strconv.FormatBool(r.Filter.Enabled))
 	b.WriteByte('\n')
 	writePorts := func(ports []Port) {
 		for _, p := range ports {
@@ -128,9 +161,20 @@ func (r PortReport) IdempotencyKey() string {
 			b.WriteByte('\n')
 		}
 	}
-	writePorts(r.ObservedPorts)
+	writePorts(r.Filter.ObservedPorts)
 	b.WriteByte('\n')
-	writePorts(r.AdditionalPorts)
+	writePorts(r.Filter.AdditionalPorts)
+	b.WriteByte('\n')
+	if r.DDoS != nil {
+		b.WriteString(strconv.FormatBool(r.DDoS.Enabled))
+		b.WriteByte('\n')
+		b.WriteString(r.DDoS.Region)
+		b.WriteByte('\n')
+		for _, cidr := range r.DDoS.AdditionalCidrList {
+			b.WriteString(cidr)
+			b.WriteByte('\n')
+		}
+	}
 	b.WriteByte('\n')
 	for _, ip := range r.IPv4Addresses {
 		b.WriteString(ip)

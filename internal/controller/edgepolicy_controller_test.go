@@ -74,7 +74,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 							Kind:       kindService,
 							Name:       "test-service",
 						},
-						AllowedRegion: &securityv1alpha1.AllowedRegionSpec{
+						DDoS: &securityv1alpha1.DDoSSpec{
 							Region: "norway",
 						},
 					},
@@ -149,7 +149,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					AllowedRegion: &securityv1alpha1.AllowedRegionSpec{Region: "norway"},
+					DDoS: &securityv1alpha1.DDoSSpec{Region: "norway"},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -250,7 +250,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+					Filter: &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -323,8 +323,9 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(report.ClusterID).NotTo(BeEmpty())
 			Expect(report.IPv4Addresses).To(ConsistOf("203.0.113.10"))
 			Expect(report.IPv6Addresses).To(ConsistOf("2001:db8::10"))
-			Expect(report.ObservedPorts).To(HaveLen(1))
-			Expect(report.ObservedPorts[0].Port).To(Equal(int32(443)))
+			Expect(report.Filter.Enabled).To(BeTrue())
+			Expect(report.Filter.ObservedPorts).To(HaveLen(1))
+			Expect(report.Filter.ObservedPorts[0].Port).To(Equal(int32(443)))
 
 			By("confirming the observed IPs were recorded on the policy status")
 			reconciled := &securityv1alpha1.EdgePolicy{}
@@ -363,7 +364,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 					},
 					Datacenter: dcEast,
 					Filter: &securityv1alpha1.FilterSpec{
-						Enable: true,
+						Enabled: true,
 						AdditionalPortList: []securityv1alpha1.AdditionalPort{
 							{Name: "ping", Port: 0, Protocol: "ICMP"},
 							{Name: " h", Port: 8080, Protocol: "TCP"},
@@ -427,10 +428,90 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(reporter.reports).To(HaveLen(1))
 			report := reporter.reports[0]
 			Expect(report.Datacenter).To(Equal(dcEast))
-			Expect(report.ObservedPorts).To(HaveLen(1))
-			Expect(report.AdditionalPorts).To(HaveLen(2))
-			Expect(report.AdditionalPorts[0].Protocol).To(Equal("ICMP"))
-			Expect(report.AdditionalPorts[1].Port).To(Equal(int32(8080)))
+			Expect(report.Filter.ObservedPorts).To(HaveLen(1))
+			Expect(report.Filter.AdditionalPorts).To(HaveLen(2))
+			Expect(report.Filter.AdditionalPorts[0].Protocol).To(Equal("ICMP"))
+			Expect(report.Filter.AdditionalPorts[1].Port).To(Equal(int32(8080)))
+		})
+
+		It("reports enabled=false when the filter block is present but disabled", func() {
+			reporter := &fakeReporter{}
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: reporter,
+			}
+
+			const disabledServiceName = "disabled-filter-svc"
+			policyKey := types.NamespacedName{Name: "disabled-filter-policy", Namespace: namespace}
+			serviceKey := types.NamespacedName{Name: disabledServiceName, Namespace: namespace}
+
+			By("creating an EdgePolicy whose filter block is present but disabled")
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      policyKey.Name,
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       disabledServiceName,
+					},
+					Datacenter: dcEast,
+					Filter:     &securityv1alpha1.FilterSpec{Enabled: false},
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &securityv1alpha1.EdgePolicy{}
+				if err := k8sClient.Get(ctx, policyKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			service := &corev1.Service{
+				Name:        disabledServiceName,
+				Namespace:   namespace,
+				Annotations: map[string]string{secretAnnotation: "disabled-secret"},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.42"}}
+			Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, serviceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("creating the Secret the target Service references")
+			secret := &corev1.Secret{
+				Name:      "disabled-secret",
+				Namespace: namespace,
+				Data:      map[string][]byte{secretDataKey: []byte("disabled-cr3d")},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
+			By("reconciling: first adds the finalizer, second protects and reports")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("confirming a report was still sent, carrying filter.enabled=false")
+			Expect(reporter.reports).To(HaveLen(1))
+			Expect(reporter.reports[0].Filter.Enabled).To(BeFalse())
+			Expect(reporter.reports[0].ServiceName).To(Equal(disabledServiceName))
 		})
 
 		It("withdraws the reported ports upstream when the policy is deleted", func() {
@@ -452,7 +533,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Name:       deleteServiceName,
 					},
 					Datacenter: "no-west-az2",
-					Filter:     &securityv1alpha1.FilterSpec{Enable: true},
+					Filter:     &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			delPolicyKey := types.NamespacedName{Name: "delete-policy", Namespace: namespace}
@@ -511,7 +592,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 			del := reporter.deletes[0]
 			Expect(del.ServiceName).To(Equal(deleteServiceName))
 			Expect(del.Datacenter).To(Equal("no-west-az2"))
-			Expect(del.ObservedPorts).To(HaveLen(1))
+			Expect(del.Filter.ObservedPorts).To(HaveLen(1))
 
 			By("confirming the withdraw carries the resolved IPAM credential")
 			Expect(del.IpamSecret).To(Equal("d3l3te-cr3d"))
@@ -552,7 +633,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+					Filter: &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -636,7 +717,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+					Filter: &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -741,7 +822,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+					Filter: &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -848,7 +929,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+					Filter: &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -968,7 +1049,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+					Filter: &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -1063,7 +1144,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+					Filter: &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -1169,7 +1250,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+					Filter: &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
@@ -1259,7 +1340,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 						Kind:       kindService,
 						Name:       serviceName,
 					},
-					Filter: &securityv1alpha1.FilterSpec{Enable: true},
+					Filter: &securityv1alpha1.FilterSpec{Enabled: true},
 				},
 			}
 			Expect(k8sClient.Create(ctx, policy)).To(Succeed())

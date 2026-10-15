@@ -27,7 +27,7 @@ import (
 
 // EdgePolicySpec defines the desired state of EdgePolicy
 //
-// +kubebuilder:validation:XValidation:rule="has(self.filter) || has(self.allowedRegion)",message="At least one of filter or allowedRegion must be specified"
+// +kubebuilder:validation:XValidation:rule="has(self.filter) || has(self.ddos)",message="At least one of filter or ddos must be specified"
 type EdgePolicySpec struct {
 	// TargetRef references the object in the same namespace that this policy applies to.
 	// +required
@@ -43,19 +43,20 @@ type EdgePolicySpec struct {
 	// +kubebuilder:validation:Enum=no-east-az1;no-east-az2;no-central-az1;no-central-az2;no-west-az1;no-west-az2;no-north-az1;no-north-az2
 	Datacenter string `json:"datacenter"`
 
-	// Geographic region policy with optional additional allowed IP ranges.
+	// DDoS configures the DDoS geographic region policy with optional additional
+	// allowed IP ranges.
 	// +optional
-	AllowedRegion *AllowedRegionSpec `json:"allowedRegion,omitempty"`
+	DDoS *DDoSSpec `json:"ddos,omitempty"`
 }
 
 // FilterSpec configures port-discovery reporting and any additional ports a policy
 // declares beyond those exposed by the target Service.
 type FilterSpec struct {
-	// Enable turns on service port discovery and reporting to the upstream system.
+	// Enabled turns on service port discovery and reporting to the upstream system.
 	// Defaults to false when omitted.
 	// +optional
 	// +kubebuilder:default=false
-	Enable bool `json:"enable,omitempty"`
+	Enabled bool `json:"enabled,omitempty"`
 
 	// AdditionalPortList declares extra ports to report upstream in addition to the
 	// ports discovered on the target Service.
@@ -102,11 +103,18 @@ type TargetReference struct {
 	Name string `json:"name"`
 }
 
-// AllowedRegionSpec defines the geographic policy and CIDR exceptions.
-type AllowedRegionSpec struct {
+// DDoSSpec defines the DDoS geographic policy and CIDR exceptions.
+type DDoSSpec struct {
+	// Enabled turns on the DDoS geographic region policy. Defaults to false when
+	// omitted.
+	// +optional
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
 	// Geographic region permitted by the edge policy.
+	// +optional
 	// +kubebuilder:validation:Enum=norway;nordics;europe
-	Region string `json:"region"`
+	Region string `json:"region,omitempty"`
 
 	// Additional IPv4 or IPv6 CIDR ranges allowed regardless of geographic region.
 	// +optional
@@ -115,7 +123,7 @@ type AllowedRegionSpec struct {
 	// +kubebuilder:validation:items:Type=string
 	// +kubebuilder:validation:items:MaxLength=43
 	// +kubebuilder:validation:XValidation:rule="self.all(cidr, isCIDR(cidr))",message="Each entry must be a valid IPv4 or IPv6 CIDR"
-	AdditionalAllowList []string `json:"additionalAllowList,omitempty"`
+	AdditionalCidrList []string `json:"additionalCidrList,omitempty"`
 }
 
 // ObservedPort describes a port discovered on the target Service.

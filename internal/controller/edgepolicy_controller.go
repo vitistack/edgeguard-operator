@@ -81,7 +81,7 @@ const (
 
 	// conditionTypeUpstreamReady reports whether upstream port reporting is
 	// configured (i.e. a BaseURL is set from UPSTREAM_API_URL). It is only
-	// evaluated for policies that enable filter reporting.
+	// evaluated for policies that declare a filter block.
 	conditionTypeUpstreamReady = "UpstreamReady"
 
 	reasonUpstreamNotConfigured = "UpstreamNotConfigured"
@@ -255,8 +255,9 @@ func (r *EdgePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 }
 
 // reconcileProtectedService records the discovered ports and IPs of a protected
-// LoadBalancer Service on the policy status, reports them upstream when filter is
-// enabled, and persists the status only when something actually changed.
+// LoadBalancer Service on the policy status, reports them upstream when the policy
+// declares a filter block (with filter.enabled carried through to the report), and
+// persists the status only when something actually changed.
 //
 // A transient upstream report failure is treated as soft: it is logged at Info
 // level and requeued after upstreamRetryInterval rather than returned as an error,
@@ -272,14 +273,15 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 	// even when the discovered ports and IPs are unchanged.
 	generationChanged := policy.Generation != policy.Status.ObservedGeneration
 
-	// Resolve the IPAM secret (when filter reporting is enabled) and surface its
-	// state on the status. A missing Secret is tolerated: the policy reports a
-	// not-found condition but reconciliation continues with an empty credential.
+	// Resolve the IPAM secret (when the policy declares a filter or ddos block) and
+	// surface its state on the status. A missing Secret is tolerated: the policy
+	// reports a not-found condition but reconciliation continues with an empty
+	// credential.
 	var ipamSecret string
 	secretChanged := false
 	upstreamChanged := false
 	upstreamConfigured := false
-	if filterEnabled(policy) {
+	if reportConfigured(policy) {
 		value, state, err := r.resolveIpamSecret(ctx, service)
 		if err != nil {
 			log.Error(err, "Failed to resolve IPAM secret", "service", service.Name)
@@ -298,7 +300,7 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 			upstreamChanged = setUpstreamConfiguredCondition(policy, false)
 		}
 	} else {
-		// No reporting configured; drop any stale secret / upstream conditions and
+		// No filter or ddos block; drop any stale secret / upstream conditions and
 		// forget any remembered rejection.
 		secretChanged = meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeIpamSecretReady)
 		upstreamChanged = meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeUpstreamReady)
@@ -316,7 +318,7 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 	portsChanged := !observedPortsEqual(policy.Status.ObservedPorts, desiredPorts)
 	ipsChanged := !stringSlicesEqual(policy.Status.ObservedIPs, desiredIPs)
 	if portsChanged || ipsChanged || generationChanged {
-		if filterEnabled(policy) && upstreamConfigured {
+		if reportConfigured(policy) && upstreamConfigured {
 			key, err := r.reportPortsUpstream(ctx, policy, service, ipamSecret, desiredPorts, desiredIPs)
 			switch {
 			case errors.Is(err, errReportSuppressed):
@@ -397,20 +399,63 @@ func observedPortsEqual(a, b []securityv1alpha1.ObservedPort) bool {
 	return true
 }
 
-// filterEnabled reports whether the policy opts into upstream port reporting via
-// spec.filter.enable.
+// filterConfigured reports whether the policy declares a filter block at all,
+// regardless of whether it is enabled. It gates upstream reporting: a policy with a
+// filter block is reported on every content change so the upstream tracks the current
+// state, including spec.filter.enabled flipping to false.
+func filterConfigured(policy *securityv1alpha1.EdgePolicy) bool {
+	return policy.Spec.Filter != nil
+}
+
+// ddosConfigured reports whether the policy declares a ddos block at all, regardless
+// of whether it is enabled. Like filterConfigured it gates upstream reporting so the
+// upstream tracks the DDoS region policy's current state on every change.
+func ddosConfigured(policy *securityv1alpha1.EdgePolicy) bool {
+	return policy.Spec.DDoS != nil
+}
+
+// reportConfigured reports whether the policy declares anything the operator reports
+// upstream — a filter block, a ddos block, or both. Reporting (and the secret and
+// upstream status conditions that support it) is driven on every content change so
+// the upstream tracks the current state of each declared block.
+func reportConfigured(policy *securityv1alpha1.EdgePolicy) bool {
+	return filterConfigured(policy) || ddosConfigured(policy)
+}
+
+// filterEnabled reports whether the policy opts into service port discovery via
+// spec.filter.enabled. Its value is carried through to the report's filter.enabled
+// flag; it no longer gates whether a report is sent (see filterConfigured).
 func filterEnabled(policy *securityv1alpha1.EdgePolicy) bool {
-	return policy.Spec.Filter != nil && policy.Spec.Filter.Enable
+	return policy.Spec.Filter != nil && policy.Spec.Filter.Enabled
+}
+
+// ddosReport maps the policy's spec.ddos block into the upstream payload
+// representation, or nil when the policy declares no ddos block so the report omits
+// the ddos section entirely. The additionalCidrList is always a non-nil slice
+// (empty when none are declared) so it serializes as [] rather than null.
+func ddosReport(policy *securityv1alpha1.EdgePolicy) *upstream.DDoSReport {
+	if policy.Spec.DDoS == nil {
+		return nil
+	}
+	allow := make([]string, 0, len(policy.Spec.DDoS.AdditionalCidrList))
+	allow = append(allow, policy.Spec.DDoS.AdditionalCidrList...)
+	return &upstream.DDoSReport{
+		Enabled:            policy.Spec.DDoS.Enabled,
+		Region:             policy.Spec.DDoS.Region,
+		AdditionalCidrList: allow,
+	}
 }
 
 // additionalPorts maps the policy's declared spec.filter.additionalPortList into the
-// upstream payload representation.
+// upstream payload representation. It always returns a non-nil slice (empty when none
+// are declared) so the report serializes additionalPorts as [] rather than null.
 func additionalPorts(policy *securityv1alpha1.EdgePolicy) []upstream.Port {
-	if policy.Spec.Filter == nil || len(policy.Spec.Filter.AdditionalPortList) == 0 {
-		return nil
+	var list []securityv1alpha1.AdditionalPort
+	if policy.Spec.Filter != nil {
+		list = policy.Spec.Filter.AdditionalPortList
 	}
-	ports := make([]upstream.Port, 0, len(policy.Spec.Filter.AdditionalPortList))
-	for _, p := range policy.Spec.Filter.AdditionalPortList {
+	ports := make([]upstream.Port, 0, len(list))
+	for _, p := range list {
 		ports = append(ports, upstream.Port{
 			Name:     p.Name,
 			Port:     p.Port,
@@ -438,6 +483,14 @@ func (r *EdgePolicyReconciler) reportPortsUpstream(ctx context.Context, policy *
 	}
 
 	ipv4, ipv6 := splitIPFamilies(ips)
+	observed := make([]upstream.Port, 0, len(ports))
+	for _, p := range ports {
+		observed = append(observed, upstream.Port{
+			Name:     p.Name,
+			Port:     p.Port,
+			Protocol: string(p.Protocol),
+		})
+	}
 	report := upstream.PortReport{
 		ClusterID:             clusterID,
 		EdgePolicyNamespaceID: r.namespaceUID(ctx, policy.Namespace),
@@ -448,15 +501,12 @@ func (r *EdgePolicyReconciler) reportPortsUpstream(ctx context.Context, policy *
 		IpamSecret:            ipamSecret,
 		IPv4Addresses:         ipv4,
 		IPv6Addresses:         ipv6,
-		ObservedPorts:         make([]upstream.Port, 0, len(ports)),
-		AdditionalPorts:       additionalPorts(policy),
-	}
-	for _, p := range ports {
-		report.ObservedPorts = append(report.ObservedPorts, upstream.Port{
-			Name:     p.Name,
-			Port:     p.Port,
-			Protocol: string(p.Protocol),
-		})
+		Filter: upstream.FilterReport{
+			Enabled:         filterEnabled(policy),
+			ObservedPorts:   observed,
+			AdditionalPorts: additionalPorts(policy),
+		},
+		DDoS: ddosReport(policy),
 	}
 	// The upstream requires the IPAM credential and at least one load balancer
 	// address on every report; without them the report is not sent.
@@ -539,10 +589,10 @@ func (r *EdgePolicyReconciler) deactivatePolicy(ctx context.Context, policy *sec
 // IPAM credential on the withdrawal too, so it is resolved best-effort from the
 // target Service's ipam.vitistack.io/secret annotation; when the Service is already
 // gone the credential (and zone) are simply omitted. It is a no-op unless the policy
-// enables filter reporting and the Reporter is configured.
+// declares a filter or ddos block and the Reporter is configured.
 func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
 	policy *securityv1alpha1.EdgePolicy, serviceName string) error {
-	if !filterEnabled(policy) || !reporterConfigured(r.Reporter) || r.Reporter == nil {
+	if !reportConfigured(policy) || !reporterConfigured(r.Reporter) || r.Reporter == nil {
 		return nil
 	}
 
@@ -554,6 +604,14 @@ func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
 	ipamSecret, ipamZone := r.ipamCredentialForDelete(ctx, policy.Namespace, serviceName)
 
 	ipv4, ipv6 := splitIPFamilies(policy.Status.ObservedIPs)
+	observed := make([]upstream.Port, 0, len(policy.Status.ObservedPorts))
+	for _, p := range policy.Status.ObservedPorts {
+		observed = append(observed, upstream.Port{
+			Name:     p.Name,
+			Port:     p.Port,
+			Protocol: string(p.Protocol),
+		})
+	}
 	report := upstream.PortReport{
 		ClusterID:             clusterID,
 		EdgePolicyNamespaceID: r.namespaceUID(ctx, policy.Namespace),
@@ -564,15 +622,12 @@ func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
 		IpamSecret:            ipamSecret,
 		IPv4Addresses:         ipv4,
 		IPv6Addresses:         ipv6,
-		ObservedPorts:         make([]upstream.Port, 0, len(policy.Status.ObservedPorts)),
-		AdditionalPorts:       additionalPorts(policy),
-	}
-	for _, p := range policy.Status.ObservedPorts {
-		report.ObservedPorts = append(report.ObservedPorts, upstream.Port{
-			Name:     p.Name,
-			Port:     p.Port,
-			Protocol: string(p.Protocol),
-		})
+		Filter: upstream.FilterReport{
+			Enabled:         filterEnabled(policy),
+			ObservedPorts:   observed,
+			AdditionalPorts: additionalPorts(policy),
+		},
+		DDoS: ddosReport(policy),
 	}
 	// The upstream requires the IPAM credential and at least one load balancer
 	// address on a withdrawal too; without them there is nothing it can act on, so

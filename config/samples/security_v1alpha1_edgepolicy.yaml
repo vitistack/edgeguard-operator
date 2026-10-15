@@ -8,7 +8,7 @@ metadata:
 spec:
   datacenter: no-east-az1
   filter:
-    enable: true
+    enabled: true
     additionalPortList:
       - name: custom-app
         port: 8080
