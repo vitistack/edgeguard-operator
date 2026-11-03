@@ -102,7 +102,9 @@ func NewHTTPReporterWithCA(baseURL string, insecureSkipVerify bool, caBundlePath
 // system trust store plus the bundle's certificates. A path that cannot be read, or
 // that holds no parseable certificates, is returned as an error.
 func loadCABundle(path string) (*x509.CertPool, error) {
-	pem, err := os.ReadFile(path)
+	// The path is operator-supplied configuration (the --upstream-ca-bundle flag /
+	// UPSTREAM_CA_BUNDLE env var), not attacker-controlled input, so reading it is safe.
+	pem, err := os.ReadFile(path) //nolint:gosec // G304: path is trusted operator config (UPSTREAM_CA_BUNDLE)
 	if err != nil {
 		return nil, fmt.Errorf("reading upstream CA bundle %q: %w", path, err)
 	}
