@@ -131,7 +131,7 @@ type EdgePolicyReconciler struct {
 // +kubebuilder:rbac:groups=security.vitistack.io,resources=edgepolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=security.vitistack.io,resources=edgepolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=security.vitistack.io,resources=edgepolicies/finalizers,verbs=update
-// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;patch;delete
+// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get
 

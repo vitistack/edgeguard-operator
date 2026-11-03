@@ -33,6 +33,7 @@ rules:
   - get
   - list
   - patch
+  - update
   - watch
 - apiGroups:
   - security.vitistack.io
