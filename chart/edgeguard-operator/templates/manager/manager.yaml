@@ -102,6 +102,9 @@ spec:
         {{- $env = append $env (dict "name" "UPSTREAM_INSECURE_SKIP_VERIFY" "value" (.insecureSkipVerify | toString)) }}
         {{- end }}
         {{- end }}
+        {{- if $caBundle.enabled }}
+        {{- $env = append $env (dict "name" "UPSTREAM_CA_BUNDLE" "value" ($caBundle.mountPath | toString)) }}
+        {{- end }}
         {{- with .Values.manager.env }}
         {{- $env = concat $env . }}
         {{- end }}

@@ -20,9 +20,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -56,19 +58,64 @@ type HTTPReporter struct {
 // errors, which callers should treat as a misconfiguration. When insecureSkipVerify
 // is true the HTTP client skips upstream TLS verification (dev/test mirrors only).
 func NewHTTPReporter(baseURL string, insecureSkipVerify bool) *HTTPReporter {
+	// An empty CA bundle path never fails to load, so the error is safe to drop.
+	r, _ := NewHTTPReporterWithCA(baseURL, insecureSkipVerify, "")
+	return r
+}
+
+// NewHTTPReporterWithCA builds an HTTPReporter that trusts an additional CA bundle
+// when verifying the upstream's TLS certificate, in addition to the system trust
+// store. This is for upstreams fronted by a private/internal CA (the chart mounts
+// such a bundle via manager.caBundle and points this at it with UPSTREAM_CA_BUNDLE).
+//
+// caBundlePath may be empty, in which case the system trust store is used unchanged.
+// When insecureSkipVerify is true, verification is skipped entirely and the CA bundle
+// is ignored. A non-empty caBundlePath that cannot be read or contains no valid
+// certificates is a hard error, since silently falling back to the system store would
+// mask the misconfiguration the operator is trying to fix.
+func NewHTTPReporterWithCA(baseURL string, insecureSkipVerify bool, caBundlePath string) (*HTTPReporter, error) {
 	client := &http.Client{Timeout: defaultTimeout}
-	if insecureSkipVerify {
+	switch {
+	case insecureSkipVerify:
 		client.Transport = &http.Transport{
 			// InsecureSkipVerify is gated behind an explicit opt-in env var and is
 			// documented as dev/test-only, so disabling verification here is intentional.
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // opt-in via UPSTREAM_INSECURE_SKIP_VERIFY
+		}
+	case caBundlePath != "":
+		pool, err := loadCABundle(caBundlePath)
+		if err != nil {
+			return nil, err
+		}
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
 		}
 	}
 	return &HTTPReporter{
 		BaseURL:            baseURL,
 		InsecureSkipVerify: insecureSkipVerify,
 		Client:             client,
+	}, nil
+}
+
+// loadCABundle reads a PEM CA bundle from path and returns a cert pool containing the
+// system trust store plus the bundle's certificates. A path that cannot be read, or
+// that holds no parseable certificates, is returned as an error.
+func loadCABundle(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading upstream CA bundle %q: %w", path, err)
 	}
+	// Start from the system pool so public roots still verify; fall back to an empty
+	// pool if the system store is unavailable (e.g. a scratch image).
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("upstream CA bundle %q contained no valid certificates", path)
+	}
+	return pool, nil
 }
 
 // Configured reports whether the reporter has a BaseURL and can deliver reports.

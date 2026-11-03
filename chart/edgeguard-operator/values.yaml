@@ -61,7 +61,9 @@ manager:
   ## Mount a CA bundle (e.g. an internal/corporate root CA) from a ConfigMap into
   ## the manager so it can verify TLS when the upstream API presents certificates
   ## signed by that CA. Create the ConfigMap in the release namespace yourself;
-  ## this only mounts it. Prefer this over UPSTREAM_INSECURE_SKIP_VERIFY.
+  ## this only mounts it. When enabled, the manager is pointed at the mounted file
+  ## via UPSTREAM_CA_BUNDLE and trusts it in addition to the system store.
+  ## Prefer this over UPSTREAM_INSECURE_SKIP_VERIFY.
   ##
   caBundle:
     ## Set to true to mount the CA bundle ConfigMap into the manager container.

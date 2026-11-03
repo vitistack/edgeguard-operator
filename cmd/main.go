@@ -77,6 +77,7 @@ func main() {
 	var upstreamURL string
 	var disableUpstreamReporting bool
 	var upstreamInsecureSkipVerify bool
+	var upstreamCABundle string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -108,6 +109,10 @@ func main() {
 		"If set, upstream TLS certificate verification is skipped. Defaults to the "+
 			"UPSTREAM_INSECURE_SKIP_VERIFY environment variable. Intended for trusted dev/test "+
 			"mirrors with self-signed certificates; do not enable in production.")
+	flag.StringVar(&upstreamCABundle, "upstream-ca-bundle", os.Getenv("UPSTREAM_CA_BUNDLE"),
+		"Path to a PEM CA bundle to trust (in addition to the system store) when verifying the "+
+			"upstream TLS certificate, for upstreams fronted by a private/internal CA. Defaults to the "+
+			"UPSTREAM_CA_BUNDLE environment variable. Ignored when --upstream-insecure-skip-verify is set.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -230,7 +235,12 @@ func main() {
 		reporter = upstream.NoopReporter{}
 		setupLog.Info("Upstream port reporting disabled; reports are treated as successfully delivered")
 	default:
-		reporter = upstream.NewHTTPReporter(upstreamURL, upstreamInsecureSkipVerify)
+		httpReporter, err := upstream.NewHTTPReporterWithCA(upstreamURL, upstreamInsecureSkipVerify, upstreamCABundle)
+		if err != nil {
+			setupLog.Error(err, "Failed to configure upstream reporter")
+			os.Exit(1)
+		}
+		reporter = httpReporter
 		if upstreamURL != "" {
 			setupLog.Info("Upstream port reporting enabled", "upstream-url", upstreamURL)
 		} else {
@@ -239,6 +249,8 @@ func main() {
 		if upstreamInsecureSkipVerify {
 			setupLog.Info("Upstream TLS verification disabled (UPSTREAM_INSECURE_SKIP_VERIFY); " +
 				"use only with trusted dev/test mirrors")
+		} else if upstreamCABundle != "" {
+			setupLog.Info("Trusting additional upstream CA bundle", "upstream-ca-bundle", upstreamCABundle)
 		}
 	}
 

@@ -18,11 +18,17 @@ package upstream
 
 import (
 	"context"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+// testServiceName is the placeholder Service name used across reporter tests.
+const testServiceName = "svc"
 
 // TestHTTPReporterStatusHandling verifies how the reporter classifies upstream
 // responses: any 2xx is success; a 4xx is the terminal ErrUpstreamRejected; any
@@ -52,7 +58,7 @@ func TestHTTPReporterStatusHandling(t *testing.T) {
 			defer server.Close()
 
 			reporter := NewHTTPReporter(server.URL, false)
-			err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: "svc"})
+			err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
 
 			if tc.wantErr && err == nil {
 				t.Fatalf("expected an error for status %d, got nil", tc.status)
@@ -77,8 +83,78 @@ func TestHTTPReporterDeleteRejection(t *testing.T) {
 	defer server.Close()
 
 	reporter := NewHTTPReporter(server.URL, false)
-	err := reporter.DeletePorts(context.Background(), PortReport{ServiceName: "svc"})
+	err := reporter.DeletePorts(context.Background(), PortReport{ServiceName: testServiceName})
 	if !errors.Is(err, ErrUpstreamRejected) {
 		t.Fatalf("expected ErrUpstreamRejected for a 422 DELETE, got %v", err)
 	}
+}
+
+// writeCertPEM writes a DER certificate to a temp .pem file and returns its path.
+func writeCertPEM(t *testing.T, der []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	data := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("writing cert PEM: %v", err)
+	}
+	return path
+}
+
+// TestHTTPReporterCABundle verifies that a reporter configured with a CA bundle trusts
+// an upstream whose certificate is signed by that CA, while the same upstream fails
+// verification without it, and that insecureSkipVerify bypasses verification entirely.
+func TestHTTPReporterCABundle(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	caPath := writeCertPEM(t, server.Certificate().Raw)
+
+	t.Run("trusts bundled CA", func(t *testing.T) {
+		reporter, err := NewHTTPReporterWithCA(server.URL, false, caPath)
+		if err != nil {
+			t.Fatalf("NewHTTPReporterWithCA: %v", err)
+		}
+		if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+			t.Fatalf("expected report to succeed with trusted CA, got %v", err)
+		}
+	})
+
+	t.Run("fails without CA", func(t *testing.T) {
+		reporter := NewHTTPReporter(server.URL, false)
+		if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err == nil {
+			t.Fatal("expected a TLS verification error without the CA, got nil")
+		}
+	})
+
+	t.Run("insecureSkipVerify bypasses verification", func(t *testing.T) {
+		reporter, err := NewHTTPReporterWithCA(server.URL, true, "")
+		if err != nil {
+			t.Fatalf("NewHTTPReporterWithCA: %v", err)
+		}
+		if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+			t.Fatalf("expected report to succeed with insecureSkipVerify, got %v", err)
+		}
+	})
+}
+
+// TestHTTPReporterCABundleErrors verifies that an unreadable or invalid CA bundle is a
+// hard construction error rather than a silent fallback to the system trust store.
+func TestHTTPReporterCABundleErrors(t *testing.T) {
+	t.Run("missing file", func(t *testing.T) {
+		if _, err := NewHTTPReporterWithCA("https://example.test", false,
+			filepath.Join(t.TempDir(), "does-not-exist.pem")); err == nil {
+			t.Fatal("expected an error for a missing CA bundle, got nil")
+		}
+	})
+
+	t.Run("no valid certificates", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "junk.pem")
+		if err := os.WriteFile(path, []byte("not a certificate"), 0o600); err != nil {
+			t.Fatalf("writing junk file: %v", err)
+		}
+		if _, err := NewHTTPReporterWithCA("https://example.test", false, path); err == nil {
+			t.Fatal("expected an error for a CA bundle with no valid certificates, got nil")
+		}
+	})
 }
