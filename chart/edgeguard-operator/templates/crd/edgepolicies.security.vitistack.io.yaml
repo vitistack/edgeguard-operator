@@ -79,6 +79,7 @@ spec:
                 - no-west-az2
                 - no-north-az1
                 - no-north-az2
+                - test-south-az1
                 type: string
               ddos:
                 description: |-
