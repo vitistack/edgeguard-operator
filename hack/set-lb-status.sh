@@ -44,7 +44,7 @@ shift $((OPTIND - 1))
 # Default to one IPv4 + one IPv6 from the documentation ranges (RFC 5737 / 3849).
 IPS=("$@")
 if [[ ${#IPS[@]} -eq 0 ]]; then
-	IPS=("203.0.113.10" "2001:db8::10")
+	IPS=("83.118.169.60" "2001:db8::10")
 fi
 
 # Build the ingress array JSON: [{"ip":"..."},{"ip":"..."}]

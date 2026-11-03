@@ -40,7 +40,7 @@ type EdgePolicySpec struct {
 	// Datacenter is the availability zone this policy belongs to. It is included
 	// in the upstream port report.
 	// +required
-	// +kubebuilder:validation:Enum=no-east-az1;no-east-az2;no-central-az1;no-central-az2;no-west-az1;no-west-az2;no-north-az1;no-north-az2
+	// +kubebuilder:validation:Enum=no-east-az1;no-east-az2;no-central-az1;no-central-az2;no-west-az1;no-west-az2;no-north-az1;no-north-az2;test-south-az1
 	Datacenter string `json:"datacenter"`
 
 	// DDoS configures the DDoS geographic region policy with optional additional

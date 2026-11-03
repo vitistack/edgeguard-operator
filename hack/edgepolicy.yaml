@@ -3,7 +3,7 @@ kind: EdgePolicy
 metadata:
   name: my-edge-policy
 spec:
-  datacenter: no-east-az1
+  datacenter: test-south-az1
   filter:
     enabled: true
     additionalPortList:

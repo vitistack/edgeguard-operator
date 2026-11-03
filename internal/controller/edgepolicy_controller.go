@@ -148,14 +148,24 @@ type EdgePolicyReconciler struct {
 // Optimistic-concurrency conflicts are treated as a soft, expected outcome: a
 // conflict means the object changed under us (commonly the informer cache lagging
 // a recent write), so we requeue quietly on the next event instead of surfacing a
-// noisy error with a stack trace.
+// noisy error with a stack trace. A NotFound is treated the same way: it means the
+// EdgePolicy was deleted after we fetched it (e.g. a status write racing the delete),
+// so the request is dropped quietly rather than logged as a reconciler error.
 func (r *EdgePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	log := logf.FromContext(ctx)
 
-	// Soften optimistic-concurrency conflicts into a quiet requeue.
+	// Soften expected, self-healing outcomes so they are not surfaced as a noisy
+	// ERROR with a stack trace. An optimistic-concurrency conflict means the object
+	// changed under us, so we requeue quietly on the next event. A NotFound means the
+	// EdgePolicy was deleted after we fetched it (commonly a write racing the delete),
+	// so there is nothing left to reconcile and we drop the request.
 	defer func() {
-		if apierrors.IsConflict(err) {
+		switch {
+		case apierrors.IsConflict(err):
 			log.V(1).Info("Reconcile hit an update conflict; retrying on next event", "conflict", err.Error())
+			result, err = ctrl.Result{}, nil
+		case apierrors.IsNotFound(err):
+			log.Info("EdgePolicy was deleted during reconcile; nothing to do", "detail", err.Error())
 			result, err = ctrl.Result{}, nil
 		}
 	}()
