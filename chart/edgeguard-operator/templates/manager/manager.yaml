@@ -90,7 +90,22 @@ spec:
         {{- end }}
         command:
         - /manager
+        {{- $env := list }}
+        {{- with .Values.manager.upstream }}
+        {{- if .apiUrl }}
+        {{- $env = append $env (dict "name" "UPSTREAM_API_URL" "value" (.apiUrl | toString)) }}
+        {{- end }}
+        {{- if not (kindIs "invalid" .reportingDisabled) }}
+        {{- $env = append $env (dict "name" "UPSTREAM_REPORTING_DISABLED" "value" (.reportingDisabled | toString)) }}
+        {{- end }}
+        {{- if not (kindIs "invalid" .insecureSkipVerify) }}
+        {{- $env = append $env (dict "name" "UPSTREAM_INSECURE_SKIP_VERIFY" "value" (.insecureSkipVerify | toString)) }}
+        {{- end }}
+        {{- end }}
         {{- with .Values.manager.env }}
+        {{- $env = concat $env . }}
+        {{- end }}
+        {{- with $env }}
         env:
           {{- toYaml . | nindent 10 }}
         {{- end }}

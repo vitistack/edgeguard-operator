@@ -30,31 +30,32 @@ manager:
   args:
     - --leader-elect
 
-  ## Environment variables for the manager container.
-  ## Used to configure upstream port reporting (see the project README).
-  ##   - UPSTREAM_API_URL: base URL of the upstream IPAM API that receives
-  ##     port reports. Leave unset to disable reporting; policies with
-  ##     filter.enabled: true then report UpstreamReady=False/UpstreamNotConfigured.
-  ##   - UPSTREAM_REPORTING_DISABLED: set to "true" to treat every report as
-  ##     delivered without any outbound call (takes precedence over the URL).
-  ##   - UPSTREAM_INSECURE_SKIP_VERIFY: set to "true" to skip upstream TLS
-  ##     certificate verification. For trusted dev/test mirrors with self-signed
-  ##     certificates only; do not enable in production.
+  ## Upstream port-reporting configuration.
+  ## These are rendered into the manager's UPSTREAM_* environment variables (see the
+  ## project README). They are exposed as named keys so they can be set cleanly via
+  ## `helm --set` or GitOps parameters (e.g. manager.upstream.apiUrl) without
+  ## depending on the order of an env list.
+  ##   - apiUrl: base URL of the upstream IPAM API that receives port reports.
+  ##     Leave empty ("") to disable reporting; policies with filter.enabled: true
+  ##     then report UpstreamReady=False/UpstreamNotConfigured.
+  ##   - reportingDisabled: set to "true" to treat every report as delivered without
+  ##     any outbound call (takes precedence over apiUrl).
+  ##   - insecureSkipVerify: set to "true" to skip upstream TLS certificate
+  ##     verification. For trusted dev/test mirrors with self-signed certificates
+  ##     only; do not enable in production.
   ##
+  upstream:
+    apiUrl: "https://edgeguard-api.vitistack.io/v1"
+    reportingDisabled: "false"
+    insecureSkipVerify: "false"
+
+  ## Additional environment variables for the manager container, appended after the
+  ## upstream variables above. Use this for anything not covered by manager.upstream.
+  ##
+  env: []
   # env:
-  #   - name: UPSTREAM_API_URL
-  #     value: "https://edgeguard-api.vitistack.io/v1"
-  #   - name: UPSTREAM_REPORTING_DISABLED
-  #     value: "false"
-  #   - name: UPSTREAM_INSECURE_SKIP_VERIFY
-  #     value: "false"
-  env:
-    - name: UPSTREAM_API_URL
-      value: "https://edgeguard-api.vitistack.io/v1"
-    - name: UPSTREAM_REPORTING_DISABLED
-      value: "false"
-    - name: UPSTREAM_INSECURE_SKIP_VERIFY
-      value: "false"
+  #   - name: SOME_OTHER_VAR
+  #     value: "value"
 
   ## CA certificate bundle mount.
   ## Mount a CA bundle (e.g. an internal/corporate root CA) from a ConfigMap into
