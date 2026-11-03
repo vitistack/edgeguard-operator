@@ -76,7 +76,7 @@ func TestIdempotencyKeyChangesWithDedupeFields(t *testing.T) {
 		},
 		"ddos added":            func(r *PortReport) { r.DDoS = &DDoSReport{Enabled: true} },
 		"ddos present disabled": func(r *PortReport) { r.DDoS = &DDoSReport{Enabled: false} },
-		"ddos region":           func(r *PortReport) { r.DDoS = &DDoSReport{Enabled: true, Region: "nordics"} },
+		"ddos region":           func(r *PortReport) { r.DDoS = &DDoSReport{Enabled: true, Region: "nordic"} },
 		"ddos cidr list added": func(r *PortReport) {
 			r.DDoS = &DDoSReport{Enabled: true, AdditionalCidrList: []string{"192.0.2.0/24"}}
 		},

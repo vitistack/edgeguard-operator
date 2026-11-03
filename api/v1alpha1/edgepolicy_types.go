@@ -113,7 +113,7 @@ type DDoSSpec struct {
 
 	// Geographic region permitted by the edge policy.
 	// +optional
-	// +kubebuilder:validation:Enum=norway;nordics;europe
+	// +kubebuilder:validation:Enum=norway;nordic;europe
 	Region string `json:"region,omitempty"`
 
 	// Additional IPv4 or IPv6 CIDR ranges allowed regardless of geographic region.

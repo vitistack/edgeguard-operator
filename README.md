@@ -23,7 +23,7 @@ For each `EdgePolicy` the operator:
 - 🔗 **Protects the target Service** with a finalizer, so the policy can react before the Service is deleted.
 - 🔎 **Discovers** the Service's ports and load balancer ingress IPs (split into IPv4 / IPv6).
 - 📡 **Reports** the discovered state to an external upstream API (whenever `spec.filter` or `spec.ddos` is set — `filter.enabled` is carried in the payload to signal whether discovery is on), enriched with the datacenter, any user-declared additional ports, an IPAM zone, and a credential resolved from a Kubernetes `Secret`. When a policy or its Service is removed, the operator **withdraws** the report with an HTTP `DELETE`.
-- 🌍 **Declares a DDoS region policy** (`norway` / `nordics` / `europe`) plus optional extra CIDR allowances, reported upstream.
+- 🌍 **Declares a DDoS region policy** (`norway` / `nordic` / `europe`) plus optional extra CIDR allowances, reported upstream.
 - 🧭 **Surfaces everything on `.status`** as standard `metav1.Condition`s, visible with `kubectl get edgepolicies`.
 
 Reconciliation is **idempotent** and tolerant: missing Secrets, missing upstream configuration, and transient upstream outages are surfaced on the status rather than crashing the reconcile loop.
@@ -68,7 +68,7 @@ flowchart LR
 | `filter.additionalPortList` | []AdditionalPort | ⬜ | Extra user-declared ports reported upstream alongside the discovered Service ports (max 256). |
 | `datacenter` | enum | ✅ | Availability zone the policy belongs to, reported upstream. One of `no-east-az1`, `no-east-az2`, `no-central-az1`, `no-central-az2`, `no-west-az1`, `no-west-az2`, `no-north-az1`, `no-north-az2`. |
 | `ddos.enabled` | bool | ⬜ | Whether the DDoS geographic region policy is on. Reflected in the upstream report's `ddos.enabled`. Defaults to `false` when omitted. |
-| `ddos.region` | enum | ⬜ | One of `norway`, `nordics`, `europe`. |
+| `ddos.region` | enum | ⬜ | One of `norway`, `nordic`, `europe`. |
 | `ddos.additionalCidrList` | []CIDR | ⬜ | Extra IPv4/IPv6 CIDRs allowed regardless of region (max 256). |
 
 **`AdditionalPort`** (each entry in `filter.additionalPortList`):

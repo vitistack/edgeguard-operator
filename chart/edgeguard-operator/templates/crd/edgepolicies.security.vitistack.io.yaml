@@ -107,7 +107,7 @@ spec:
                     description: Geographic region permitted by the edge policy.
                     enum:
                     - norway
-                    - nordics
+                    - nordic
                     - europe
                     type: string
                 type: object
