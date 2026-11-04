@@ -115,6 +115,12 @@ var ErrIncompleteReport = errors.New("incomplete port report")
 // or its target Service changes.
 var ErrUpstreamRejected = errors.New("upstream rejected port report")
 
+// ErrUpstreamNotFound indicates the upstream returned 404. It wraps ErrUpstreamRejected
+// so report (POST) handling still treats it as a terminal rejection, while withdrawal
+// (DELETE) handling can single it out and treat it as success: a 404 on a withdrawal
+// means the upstream has no record of the report, i.e. it is already gone.
+var ErrUpstreamNotFound = fmt.Errorf("%w (not found)", ErrUpstreamRejected)
+
 // Validate reports whether the payload carries the fields the upstream requires on
 // every report and withdrawal: a resolved IPAM credential (IpamSecret) and at least
 // one load balancer address (an IPv4 or IPv6 entry). It returns an error wrapping

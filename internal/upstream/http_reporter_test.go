@@ -151,6 +151,25 @@ func TestHTTPReporterDeleteRejection(t *testing.T) {
 	}
 }
 
+// TestHTTPReporterNotFound confirms a 404 is surfaced as ErrUpstreamNotFound, which
+// also satisfies errors.Is(err, ErrUpstreamRejected) so report handling still treats it
+// as terminal while withdrawal handling can single out the already-gone case.
+func TestHTTPReporterNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	reporter := NewHTTPReporter(server.URL, false)
+	err := reporter.DeletePorts(context.Background(), PortReport{ServiceName: testServiceName})
+	if !errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("expected ErrUpstreamNotFound for a 404, got %v", err)
+	}
+	if !errors.Is(err, ErrUpstreamRejected) {
+		t.Fatalf("expected a 404 to also satisfy ErrUpstreamRejected, got %v", err)
+	}
+}
+
 // writeCertPEM writes a DER certificate to a temp .pem file and returns its path.
 func writeCertPEM(t *testing.T, der []byte) string {
 	t.Helper()

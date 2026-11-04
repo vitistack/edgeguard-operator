@@ -242,15 +242,17 @@ func (h *HTTPReporter) send(ctx context.Context, method string, report PortRepor
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Any 2xx status counts as the report being accepted. A 4xx is a client error:
-	// the upstream refused the request and it will not succeed if retried unchanged,
-	// so it is reported as the terminal ErrUpstreamRejected. Anything else (5xx,
-	// redirects, ...) is a transient failure the controller surfaces and retries. The
-	// upstream's response body is included in the error (and thus the log) to aid
+	// Any 2xx status counts as the report being accepted. A 404 is singled out as
+	// ErrUpstreamNotFound (it wraps ErrUpstreamRejected) so a withdrawal can treat it as
+	// already-gone; any other 4xx is the terminal ErrUpstreamRejected. Anything else
+	// (5xx, redirects, ...) is a transient failure the controller surfaces and retries.
+	// The upstream's response body is included in the error (and thus the log) to aid
 	// debugging a rejection.
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return nil
+	case resp.StatusCode == http.StatusNotFound:
+		return fmt.Errorf("%w: status 404: %s", ErrUpstreamNotFound, upstreamResponseBody(resp))
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		return fmt.Errorf("%w: status %d: %s", ErrUpstreamRejected, resp.StatusCode, upstreamResponseBody(resp))
 	default:

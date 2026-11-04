@@ -601,6 +601,192 @@ var _ = Describe("EdgePolicy Controller", func() {
 			By("confirming the policy finalizer was released so the object is gone")
 			Expect(errors.IsNotFound(k8sClient.Get(ctx, delPolicyKey, &securityv1alpha1.EdgePolicy{}))).To(BeTrue())
 		})
+
+		It("holds the finalizer and requeues when the withdrawal is rejected (non-404 4xx)", func() {
+			const (
+				rejectService    = "delete-reject-service"
+				rejectSecretName = "reject-secret"
+			)
+			reporter := &fakeReporter{
+				deleteErr: fmt.Errorf("%w: status 400: Bad Request", upstream.ErrUpstreamRejected),
+			}
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: reporter,
+			}
+
+			rejectPolicyKey := types.NamespacedName{Name: "delete-reject-policy", Namespace: namespace}
+			rejectServiceKey := types.NamespacedName{Name: rejectService, Namespace: namespace}
+
+			By("creating a filter-enabled EdgePolicy and its LoadBalancer Service")
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      "delete-reject-policy",
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       rejectService,
+					},
+					Datacenter: "no-east-az2",
+					Filter:     &securityv1alpha1.FilterSpec{Enabled: true},
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &securityv1alpha1.EdgePolicy{}
+				if err := k8sClient.Get(ctx, rejectPolicyKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+					_ = k8sClient.Update(ctx, fetched)
+				}
+			})
+
+			service := &corev1.Service{
+				Name:      rejectService,
+				Namespace: namespace,
+				Annotations: map[string]string{
+					secretAnnotation: rejectSecretName,
+					zoneAnnotation:   "bergen-1",
+				},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.41"}}
+			Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, rejectServiceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("creating the Secret the target Service references")
+			secret := &corev1.Secret{
+				Name:      rejectSecretName,
+				Namespace: namespace,
+				Data:      map[string][]byte{secretDataKey: []byte("d3l3te-cr3d")},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
+			By("reconciling so the policy protects the Service and reports once")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: rejectPolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: rejectPolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reporter.reports).To(HaveLen(1))
+
+			By("deleting the policy; a rejected withdrawal must hold the finalizer and requeue")
+			Expect(k8sClient.Delete(ctx, policy)).To(Succeed())
+			res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: rejectPolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(upstreamRetryInterval))
+
+			By("confirming the withdrawal was not accepted and the finalizer was NOT removed")
+			Expect(reporter.deletes).To(BeEmpty())
+			stuck := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, rejectPolicyKey, stuck)).To(Succeed())
+			Expect(controllerutil.ContainsFinalizer(stuck, edgePolicyFinalizer)).To(BeTrue())
+		})
+
+		It("removes the finalizer when the withdrawal returns 404 (already gone)", func() {
+			const (
+				goneService    = "delete-gone-service"
+				goneSecretName = "gone-secret"
+			)
+			reporter := &fakeReporter{
+				deleteErr: fmt.Errorf("%w: status 404: 404 Not Found", upstream.ErrUpstreamNotFound),
+			}
+			reconciler := &EdgePolicyReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Reporter: reporter,
+			}
+
+			gonePolicyKey := types.NamespacedName{Name: "delete-gone-policy", Namespace: namespace}
+			goneServiceKey := types.NamespacedName{Name: goneService, Namespace: namespace}
+
+			By("creating a filter-enabled EdgePolicy and its LoadBalancer Service")
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:      "delete-gone-policy",
+				Namespace: namespace,
+				Spec: securityv1alpha1.EdgePolicySpec{
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       goneService,
+					},
+					Datacenter: "no-central-az1",
+					Filter:     &securityv1alpha1.FilterSpec{Enabled: true},
+				},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &securityv1alpha1.EdgePolicy{}
+				if err := k8sClient.Get(ctx, gonePolicyKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+					_ = k8sClient.Update(ctx, fetched)
+				}
+			})
+
+			service := &corev1.Service{
+				Name:      goneService,
+				Namespace: namespace,
+				Annotations: map[string]string{
+					secretAnnotation: goneSecretName,
+					zoneAnnotation:   "bergen-1",
+				},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Port: 443}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, service)).To(Succeed())
+			service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.42"}}
+			Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+			DeferCleanup(func() {
+				fetched := &corev1.Service{}
+				if err := k8sClient.Get(ctx, goneServiceKey, fetched); err == nil {
+					controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+					Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+				}
+			})
+
+			By("creating the Secret the target Service references")
+			secret := &corev1.Secret{
+				Name:      goneSecretName,
+				Namespace: namespace,
+				Data:      map[string][]byte{secretDataKey: []byte("d3l3te-cr3d")},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
+			By("reconciling so the policy protects the Service and reports once")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: gonePolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: gonePolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reporter.reports).To(HaveLen(1))
+
+			By("deleting the policy; a 404 withdrawal is treated as already gone, so deletion completes")
+			Expect(k8sClient.Delete(ctx, policy)).To(Succeed())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: gonePolicyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("confirming the finalizer was released so the object is gone")
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, gonePolicyKey, &securityv1alpha1.EdgePolicy{}))).To(BeTrue())
+		})
 	})
 
 	Context("When the upstream URL is not configured", func() {
@@ -1442,6 +1628,9 @@ type fakeReporter struct {
 	// tests can assert a report was (or was not) re-attempted independently of success.
 	reportAttempts int
 	err            error
+	// deleteErr, when set, is returned by DeletePorts (taking precedence over err) so a
+	// test can fail a withdrawal while letting the initial report succeed.
+	deleteErr error
 }
 
 func (f *fakeReporter) ReportPorts(_ context.Context, report upstream.PortReport) error {
@@ -1454,6 +1643,9 @@ func (f *fakeReporter) ReportPorts(_ context.Context, report upstream.PortReport
 }
 
 func (f *fakeReporter) DeletePorts(_ context.Context, report upstream.PortReport) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	if f.err != nil {
 		return f.err
 	}

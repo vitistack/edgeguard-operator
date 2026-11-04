@@ -182,21 +182,25 @@ func (r *EdgePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// finalizer, then drop our own.
 	if !policy.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&policy, edgePolicyFinalizer) {
-			// Withdraw the policy's ports upstream before we let the object go. A
-			// transient failure holds the finalizer and requeues so the delete is
-			// retried rather than leaving stale upstream state. A withdrawal we cannot
-			// even form (missing credential or addresses) or one the upstream refuses
-			// with a 4xx is skipped so deletion is never blocked on a precondition that
-			// retrying will not satisfy.
+			// Withdraw the policy's ports upstream before we let the object go. Only a 2xx
+			// (or a 404, meaning the upstream has no record of the report — already gone)
+			// confirms the withdrawal; any other 4xx rejection or a 5xx/transport failure
+			// holds the finalizer and requeues so the delete is retried rather than leaving
+			// stale upstream state. The further exception is a withdrawal we cannot even
+			// form (missing credential or addresses, e.g. the target Service is already
+			// gone): no request is sent, so there is nothing upstream to confirm and
+			// deletion proceeds rather than wedging on a precondition retrying cannot meet.
 			if err := r.deletePortsUpstream(ctx, &policy, policy.Spec.TargetRef.Name); err != nil {
 				switch {
+				case errors.Is(err, upstream.ErrUpstreamNotFound):
+					log.Info("Upstream had no record of the report during deletion; treating as already withdrawn",
+						"edgepolicy", policy.Name, "detail", err.Error())
 				case errors.Is(err, upstream.ErrIncompleteReport):
 					log.Info("Skipped upstream withdrawal during deletion; required fields missing",
 						"edgepolicy", policy.Name, "detail", err.Error())
-				case errors.Is(err, upstream.ErrUpstreamRejected):
-					log.Info("Skipped upstream withdrawal during deletion; upstream rejected it",
-						"edgepolicy", policy.Name, "detail", err.Error())
 				default:
+					// Upstream refused (non-404 4xx) or could not be reached (5xx/transport):
+					// hold the finalizer and retry until the withdrawal is accepted.
 					log.Info("Could not withdraw ports upstream during deletion; will retry",
 						"edgepolicy", policy.Name, "retryAfter", upstreamRetryInterval.String(), "error", err.Error())
 					return ctrl.Result{RequeueAfter: upstreamRetryInterval}, nil
@@ -559,17 +563,21 @@ func (r *EdgePolicyReconciler) deactivatePolicy(ctx context.Context, policy *sec
 	if hadState {
 		if err := r.deletePortsUpstream(ctx, policy, service.Name); err != nil {
 			switch {
+			case errors.Is(err, upstream.ErrUpstreamNotFound):
+				// 404: the upstream has no record of the report — already withdrawn/gone.
+				// Treat as success and release the Service finalizer.
+				log.Info("Upstream had no record of the report; treating as already withdrawn",
+					"service", service.Name, "transition", note, "detail", err.Error())
 			case errors.Is(err, upstream.ErrIncompleteReport):
-				// Nothing valid to withdraw (missing credential or addresses); do not
-				// hold the Service finalizer on a precondition that will not be met.
+				// Nothing valid to withdraw (missing credential or addresses): no request
+				// is sent, so there is no upstream state to confirm. Release the finalizer
+				// rather than holding it on a precondition that will not be met.
 				log.Info("Skipped upstream withdrawal; required fields missing",
 					"service", service.Name, "transition", note, "detail", err.Error())
-			case errors.Is(err, upstream.ErrUpstreamRejected):
-				// A 4xx will not succeed on retry; proceed rather than holding the
-				// Service finalizer indefinitely.
-				log.Info("Skipped upstream withdrawal; upstream rejected it",
-					"service", service.Name, "transition", note, "detail", err.Error())
 			default:
+				// Upstream refused (non-404 4xx) or could not be reached (5xx/transport):
+				// only a 2xx confirms the withdrawal, so hold the Service finalizer and
+				// retry rather than releasing it and leaving stale upstream state.
 				log.Info("Could not withdraw ports upstream; will retry",
 					"service", service.Name, "transition", note,
 					"retryAfter", upstreamRetryInterval.String(), "error", err.Error())
