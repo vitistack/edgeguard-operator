@@ -136,6 +136,36 @@ func TestHTTPReporterCABundle(t *testing.T) {
 			t.Fatalf("expected report to succeed with insecureSkipVerify, got %v", err)
 		}
 	})
+
+	t.Run("trusts CA from a directory mount", func(t *testing.T) {
+		// Mimic a ConfigMap mounted as a directory (no subPath): the CA sits in a real
+		// data dir, exposed via a "..data" symlink, with the key a symlink into it. The
+		// loader must read the cert and ignore the ".."-prefixed atomic-writer artifacts.
+		dir := t.TempDir()
+		dataDir := filepath.Join(dir, "..2026_data")
+		if err := os.Mkdir(dataDir, 0o700); err != nil {
+			t.Fatalf("mkdir data dir: %v", err)
+		}
+		caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+		if err := os.WriteFile(filepath.Join(dataDir, "nhn-certbundle.crt"), caPEM, 0o600); err != nil {
+			t.Fatalf("writing cert into data dir: %v", err)
+		}
+		if err := os.Symlink("..2026_data", filepath.Join(dir, "..data")); err != nil {
+			t.Fatalf("symlink ..data: %v", err)
+		}
+		if err := os.Symlink(filepath.Join("..data", "nhn-certbundle.crt"),
+			filepath.Join(dir, "nhn-certbundle.crt")); err != nil {
+			t.Fatalf("symlink key: %v", err)
+		}
+
+		reporter, err := NewHTTPReporterWithCA(server.URL, false, dir)
+		if err != nil {
+			t.Fatalf("NewHTTPReporterWithCA: %v", err)
+		}
+		if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+			t.Fatalf("expected report to succeed with CA from directory, got %v", err)
+		}
+	})
 }
 
 // TestHTTPReporterCABundleErrors verifies that an unreadable or invalid CA bundle is a

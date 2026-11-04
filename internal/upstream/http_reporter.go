@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -98,15 +99,16 @@ func NewHTTPReporterWithCA(baseURL string, insecureSkipVerify bool, caBundlePath
 	}, nil
 }
 
-// loadCABundle reads a PEM CA bundle from path and returns a cert pool containing the
-// system trust store plus the bundle's certificates. A path that cannot be read, or
-// that holds no parseable certificates, is returned as an error.
+// loadCABundle builds a cert pool containing the system trust store plus the
+// certificates found at path. path may be a single PEM file or a directory of PEM
+// files (e.g. a whole ConfigMap mounted without subPath); in the directory case every
+// regular file is read and Kubernetes atomic-writer artifacts (".."-prefixed entries
+// such as "..data") and subdirectories are skipped. A path that cannot be read, or
+// that yields no parseable certificates, is returned as an error.
 func loadCABundle(path string) (*x509.CertPool, error) {
-	// The path is operator-supplied configuration (the --upstream-ca-bundle flag /
-	// UPSTREAM_CA_BUNDLE env var), not attacker-controlled input, so reading it is safe.
-	pem, err := os.ReadFile(path) //nolint:gosec // G304: path is trusted operator config (UPSTREAM_CA_BUNDLE)
+	files, err := caBundleFiles(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading upstream CA bundle %q: %w", path, err)
+		return nil, err
 	}
 	// Start from the system pool so public roots still verify; fall back to an empty
 	// pool if the system store is unavailable (e.g. a scratch image).
@@ -114,10 +116,59 @@ func loadCABundle(path string) (*x509.CertPool, error) {
 	if err != nil || pool == nil {
 		pool = x509.NewCertPool()
 	}
-	if !pool.AppendCertsFromPEM(pem) {
+	added := false
+	for _, f := range files {
+		// The path is operator-supplied configuration (the --upstream-ca-bundle flag /
+		// UPSTREAM_CA_BUNDLE env var), not attacker-controlled input, so reading it is safe.
+		pem, err := os.ReadFile(f) //nolint:gosec // G304: path is trusted operator config (UPSTREAM_CA_BUNDLE)
+		if err != nil {
+			return nil, fmt.Errorf("reading upstream CA bundle %q: %w", f, err)
+		}
+		if pool.AppendCertsFromPEM(pem) {
+			added = true
+		}
+	}
+	if !added {
 		return nil, fmt.Errorf("upstream CA bundle %q contained no valid certificates", path)
 	}
 	return pool, nil
+}
+
+// caBundleFiles resolves path to the list of files to read: the path itself when it is
+// a regular file, or every non-hidden regular file inside it when it is a directory.
+func caBundleFiles(path string) ([]string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading upstream CA bundle %q: %w", path, err)
+	}
+	if !info.IsDir() {
+		return []string{path}, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading upstream CA bundle directory %q: %w", path, err)
+	}
+	var files []string
+	for _, e := range entries {
+		name := e.Name()
+		// Skip Kubernetes atomic-writer artifacts ("..data", "..<timestamp>") and any
+		// other hidden entries.
+		if len(name) > 0 && name[0] == '.' {
+			continue
+		}
+		full := filepath.Join(path, name)
+		// Stat follows symlinks (ConfigMap keys are symlinks into ..data); keep only
+		// regular files.
+		fi, err := os.Stat(full)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		files = append(files, full)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("upstream CA bundle directory %q contained no files", path)
+	}
+	return files, nil
 }
 
 // Configured reports whether the reporter has a BaseURL and can deliver reports.

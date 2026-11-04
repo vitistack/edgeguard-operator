@@ -149,7 +149,7 @@ spec:
           {{- if $caBundle.enabled }}
           - name: cabundle
             mountPath: {{ $caBundle.mountPath }}
-            subPath: {{ $caBundle.fileName }}
+            readOnly: true
           {{- end }}
           {{- with .Values.manager.extraVolumeMounts }}
           {{- toYaml . | nindent 10 }}

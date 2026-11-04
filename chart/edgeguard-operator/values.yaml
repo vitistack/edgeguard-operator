@@ -61,8 +61,10 @@ manager:
   ## Mount a CA bundle (e.g. an internal/corporate root CA) from a ConfigMap into
   ## the manager so it can verify TLS when the upstream API presents certificates
   ## signed by that CA. Create the ConfigMap in the release namespace yourself;
-  ## this only mounts it. When enabled, the manager is pointed at the mounted file
-  ## via UPSTREAM_CA_BUNDLE and trusts it in addition to the system store.
+  ## this only mounts it. The whole ConfigMap is mounted as a directory and the
+  ## manager is pointed at it via UPSTREAM_CA_BUNDLE; every certificate file it
+  ## contains is trusted, in addition to the system store. Because the directory is
+  ## mounted (not an individual key), the ConfigMap key names do not matter.
   ## Prefer this over UPSTREAM_INSECURE_SKIP_VERIFY.
   ##
   caBundle:
@@ -73,10 +75,9 @@ manager:
     enabled: false
     ## Name of the ConfigMap holding the CA bundle.
     configMapName: nhn-certbundle
-    ## Key within the ConfigMap, also used as the mounted file name (subPath).
-    fileName: nhn-certbundle.crt
-    ## Absolute path the bundle file is mounted at inside the container.
-    mountPath: /etc/ssl/certs/nhn-certbundle.crt
+    ## Absolute directory path the ConfigMap is mounted at inside the container.
+    ## All certificate files found here are trusted.
+    mountPath: /etc/edgeguard/ca
 
   ## Health probes.
   ## The manager serves the liveness (/healthz) and readiness (/readyz) endpoints on this port.
