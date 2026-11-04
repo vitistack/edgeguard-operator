@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -1062,7 +1063,7 @@ func (r *EdgePolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&securityv1alpha1.EdgePolicy{}).
+		For(&securityv1alpha1.EdgePolicy{}, builder.WithPredicates(edgePolicyReconcilePredicate())).
 		Watches(
 			&corev1.Service{},
 			handler.EnqueueRequestsFromMapFunc(r.edgePoliciesForService),
@@ -1070,6 +1071,32 @@ func (r *EdgePolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Named("edgepolicy").
 		Complete(r)
+}
+
+// edgePolicyReconcilePredicate drops EdgePolicy update events that change only the
+// status or other bookkeeping fields (resourceVersion, managedFields), while keeping
+// events where the spec (generation), the deletion timestamp, or the finalizers
+// changed. This stops the controller's own Status().Update writes from re-triggering a
+// reconcile which — combined with informer cache lag — could otherwise re-send an
+// upstream report (or withdrawal) that was already delivered. Create and delete events
+// are always admitted (unset predicate funcs default to true).
+func edgePolicyReconcilePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectOld == nil || e.ObjectNew == nil {
+				return true
+			}
+			// Spec change (bumps generation), entering deletion, or a finalizer
+			// add/remove all require reconciliation; a status-only write does not.
+			if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() {
+				return true
+			}
+			if !e.ObjectOld.GetDeletionTimestamp().Equal(e.ObjectNew.GetDeletionTimestamp()) {
+				return true
+			}
+			return !slices.Equal(e.ObjectOld.GetFinalizers(), e.ObjectNew.GetFinalizers())
+		},
+	}
 }
 
 // loadBalancerServicePredicate restricts Service events to those involving a

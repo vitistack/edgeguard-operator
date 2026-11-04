@@ -203,6 +203,17 @@ func (h *HTTPReporter) send(ctx context.Context, method string, report PortRepor
 		return fmt.Errorf("upstream HTTPReporter has no BaseURL configured")
 	}
 
+	// The upstream expects ipv4Addresses and ipv6Addresses to always be present as
+	// arrays, so a report with no address of a family serializes it as [] rather than
+	// null. report is a value copy, so normalizing here does not mutate the caller's
+	// report.
+	if report.IPv4Addresses == nil {
+		report.IPv4Addresses = []string{}
+	}
+	if report.IPv6Addresses == nil {
+		report.IPv6Addresses = []string{}
+	}
+
 	body, err := json.Marshal(report)
 	if err != nil {
 		return fmt.Errorf("marshaling port report: %w", err)

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/pem"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,6 +32,30 @@ import (
 
 // testServiceName is the placeholder Service name used across reporter tests.
 const testServiceName = "svc"
+
+// TestHTTPReporterAlwaysSendsAddressArrays verifies the serialized report always
+// carries ipv4Addresses and ipv6Addresses as arrays (as [] when the Service has no
+// address of that family).
+func TestHTTPReporterAlwaysSendsAddressArrays(t *testing.T) {
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	reporter := NewHTTPReporter(server.URL, false)
+	if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+		t.Fatalf("ReportPorts: %v", err)
+	}
+	if !strings.Contains(got, `"ipv4Addresses":[]`) {
+		t.Fatalf("expected ipv4Addresses:[] in request body, got: %s", got)
+	}
+	if !strings.Contains(got, `"ipv6Addresses":[]`) {
+		t.Fatalf("expected ipv6Addresses:[] in request body, got: %s", got)
+	}
+}
 
 // TestHTTPReporterErrorIncludesBody verifies the upstream's response body and status
 // code are surfaced in the returned error (and thus the log), for both a terminal 4xx

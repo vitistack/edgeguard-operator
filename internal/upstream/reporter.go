@@ -61,9 +61,10 @@ type PortReport struct {
 	// Service's ipam.vitistack.io/secret annotation, when present.
 	IpamSecret string `json:"ipamSecret,omitempty"`
 	// IPv4Addresses and IPv6Addresses are the load balancer ingress addresses
-	// assigned to the target Service, split by IP family.
-	IPv4Addresses []string `json:"ipv4Addresses,omitempty"`
-	IPv6Addresses []string `json:"ipv6Addresses,omitempty"`
+	// assigned to the target Service, split by IP family. Both are always serialized
+	// (as [] when the Service has no address of that family) so the shape is stable.
+	IPv4Addresses []string `json:"ipv4Addresses"`
+	IPv6Addresses []string `json:"ipv6Addresses"`
 	// Filter carries the port-discovery state derived from spec.filter: whether
 	// reporting is enabled plus the discovered and user-declared ports.
 	Filter FilterReport `json:"filter"`
