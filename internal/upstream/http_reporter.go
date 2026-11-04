@@ -23,9 +23,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -232,15 +234,34 @@ func (h *HTTPReporter) send(ctx context.Context, method string, report PortRepor
 	// Any 2xx status counts as the report being accepted. A 4xx is a client error:
 	// the upstream refused the request and it will not succeed if retried unchanged,
 	// so it is reported as the terminal ErrUpstreamRejected. Anything else (5xx,
-	// redirects, ...) is a transient failure the controller surfaces and retries.
+	// redirects, ...) is a transient failure the controller surfaces and retries. The
+	// upstream's response body is included in the error (and thus the log) to aid
+	// debugging a rejection.
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return nil
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		return fmt.Errorf("%w: status %d", ErrUpstreamRejected, resp.StatusCode)
+		return fmt.Errorf("%w: status %d: %s", ErrUpstreamRejected, resp.StatusCode, upstreamResponseBody(resp))
 	default:
-		return fmt.Errorf("upstream returned unexpected status %d", resp.StatusCode)
+		return fmt.Errorf("upstream returned unexpected status %d: %s", resp.StatusCode, upstreamResponseBody(resp))
 	}
+}
+
+// maxErrorBodyBytes bounds how much of an error response body is read into an error
+// message, so a large (or hostile) upstream response cannot bloat logs or memory.
+const maxErrorBodyBytes = 2 << 10 // 2 KiB
+
+// upstreamResponseBody reads a bounded, single-line snippet of the response body for
+// inclusion in an error message. Whitespace (including newlines) is collapsed so the
+// body stays on the structured log's single error field; it returns "(empty)" when
+// there is nothing to read.
+func upstreamResponseBody(resp *http.Response) string {
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	body := strings.Join(strings.Fields(string(data)), " ")
+	if body == "" {
+		return "(empty)"
+	}
+	return body
 }
 
 // Ensure HTTPReporter satisfies the interface at compile time.

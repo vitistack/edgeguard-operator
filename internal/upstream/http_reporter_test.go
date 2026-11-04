@@ -24,11 +24,48 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
 // testServiceName is the placeholder Service name used across reporter tests.
 const testServiceName = "svc"
+
+// TestHTTPReporterErrorIncludesBody verifies the upstream's response body and status
+// code are surfaced in the returned error (and thus the log), for both a terminal 4xx
+// rejection and a transient 5xx, with newlines collapsed to a single line.
+func TestHTTPReporterErrorIncludesBody(t *testing.T) {
+	cases := map[string]struct {
+		status int
+		body   string
+		want   string
+	}{
+		"400 with body":  {status: http.StatusBadRequest, body: "invalid datacenter\n\"test-south-az1\"", want: `invalid datacenter "test-south-az1"`},
+		"500 with body":  {status: http.StatusInternalServerError, body: "boom", want: "boom"},
+		"400 empty body": {status: http.StatusBadRequest, body: "", want: "(empty)"},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			reporter := NewHTTPReporter(server.URL, false)
+			err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
+			if err == nil {
+				t.Fatalf("expected an error for status %d", tc.status)
+			}
+			if got := err.Error(); !strings.Contains(got, tc.want) ||
+				!strings.Contains(got, strconv.Itoa(tc.status)) {
+				t.Fatalf("error %q did not contain status %d and body %q", got, tc.status, tc.want)
+			}
+		})
+	}
+}
 
 // TestHTTPReporterStatusHandling verifies how the reporter classifies upstream
 // responses: any 2xx is success; a 4xx is the terminal ErrUpstreamRejected; any
