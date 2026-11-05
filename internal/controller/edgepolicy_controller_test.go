@@ -1072,6 +1072,11 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(upCond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(upCond.Reason).To(Equal(reasonUpstreamRejected))
 
+			By("confirming the upstream's rejection detail is visible on the CR")
+			Expect(reconciled.Status.RejectedReportMessage).To(Equal("status 400"))
+			Expect(upCond.Message).To(ContainSubstring(rejectedReportMessage))
+			Expect(upCond.Message).To(ContainSubstring("status 400"))
+
 			By("confirming Ready is False for the same reason")
 			ready := meta.FindStatusCondition(reconciled.Status.Conditions, conditionTypeReady)
 			Expect(ready).NotTo(BeNil())

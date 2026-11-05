@@ -34,6 +34,22 @@ import (
 // defaultTimeout bounds a single upstream request.
 const defaultTimeout = 10 * time.Second
 
+const (
+	// statusQueuePollInterval is the delay between successive polls of a report's
+	// status URL within a single report attempt.
+	statusQueuePollInterval = 2 * time.Second
+	// statusQueuePollTimeout bounds how long one report attempt waits for the queued
+	// job to reach a terminal state before giving up. Exceeding it is surfaced as a
+	// transient error so the controller requeues; because the report carries a stable
+	// Idempotency-Key, the re-submission on the next reconcile resolves to the same
+	// job and polling resumes rather than duplicating work. Keep this comfortably
+	// below the controller's reconcile expectations so a worker is not held too long.
+	statusQueuePollTimeout = 30 * time.Second
+	// maxStatusBodyBytes bounds how much of a status-queue response body is read and
+	// decoded, so a large (or hostile) upstream response cannot bloat memory.
+	maxStatusBodyBytes = 64 << 10 // 64 KiB
+)
+
 // HTTPReporter is a scaffold Reporter that POSTs port reports to an external
 // HTTP API as JSON.
 //
@@ -51,9 +67,23 @@ type HTTPReporter struct {
 	// opt-in via the UPSTREAM_INSECURE_SKIP_VERIFY environment variable and is only
 	// intended for trusted dev/test mirrors with self-signed certificates.
 	InsecureSkipVerify bool
+	// ReportingStatusQueue enables the asynchronous status-queue flow. When true, a
+	// 2xx submission is not treated as final: the upstream is expected to return a
+	// status URL in the response body, which this reporter then polls until the queued
+	// job reports completion or failure (see awaitStatusQueue). It is opt-in via the
+	// UPSTREAM_REPORTING_STATUS_QUEUE environment variable. When false, any 2xx
+	// response counts as immediate success and the body is ignored.
+	ReportingStatusQueue bool
 	// Client is the HTTP client used for requests. If nil, a client with
 	// defaultTimeout is used.
 	Client *http.Client
+	// StatusPollInterval and StatusPollTimeout override the status-queue polling
+	// cadence: the delay between polls of a report's status URL and the total budget
+	// one report attempt waits for a terminal state. When zero the statusQueuePoll*
+	// package defaults apply. They are sourced from the
+	// UPSTREAM_REPORTING_STATUS_QUEUE_POLL_INTERVAL / _TIMEOUT environment variables.
+	StatusPollInterval time.Duration
+	StatusPollTimeout  time.Duration
 }
 
 // NewHTTPReporter builds an HTTPReporter for the given base URL. A zero-value
@@ -250,7 +280,12 @@ func (h *HTTPReporter) send(ctx context.Context, method string, report PortRepor
 	// debugging a rejection.
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return nil
+		// Accepted. Without the status queue the report is done; with it, the 2xx only
+		// means the job was queued and its real outcome is polled from the status URL.
+		if !h.ReportingStatusQueue {
+			return nil
+		}
+		return h.awaitStatusQueue(ctx, resp)
 	case resp.StatusCode == http.StatusNotFound:
 		return fmt.Errorf("%w: status 404: %s", ErrUpstreamNotFound, upstreamResponseBody(resp))
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
@@ -258,6 +293,154 @@ func (h *HTTPReporter) send(ctx context.Context, method string, report PortRepor
 	default:
 		return fmt.Errorf("upstream returned unexpected status %d: %s", resp.StatusCode, upstreamResponseBody(resp))
 	}
+}
+
+// reportAck is the upstream's response to an accepted report when the status queue
+// is enabled: StatusURL is the location to poll for the queued job's outcome and
+// JobID identifies the job for logging. An empty StatusURL means the upstream
+// completed the report synchronously and there is nothing to poll.
+//
+// TODO(user): align these field names (statusUrl/jobId) with the real upstream contract.
+type reportAck struct {
+	StatusURL string `json:"statusUrl"`
+	JobID     string `json:"jobId,omitempty"`
+}
+
+// jobStatus is the upstream's response when polling a report's status URL. Status
+// carries the queued job's state and Message is an optional human-readable detail
+// included in surfaced errors.
+//
+// TODO(user): align the field names and the recognized Status values below with the
+// real upstream contract.
+type jobStatus struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+// jobSucceeded and jobFailed classify a terminal job Status (case-insensitively).
+// Any value in neither set is treated as still in progress and keeps the reporter
+// polling until the status-queue budget is spent.
+var (
+	jobSucceeded = map[string]bool{"completed": true, "complete": true, "succeeded": true, "success": true, "done": true}
+	jobFailed    = map[string]bool{"failed": true, "failure": true, "error": true, "rejected": true, "cancelled": true, "canceled": true}
+)
+
+// awaitStatusQueue polls the status URL returned by an accepted submission until the
+// queued job reaches a terminal state or the per-attempt budget is exhausted. It maps
+// the outcome onto the same error contract as a synchronous report: nil on success,
+// ErrUpstreamRejected (terminal) when the job failed, and a plain transient error on a
+// poll failure or timeout so the controller requeues and the next attempt resumes the
+// same job via the report's Idempotency-Key.
+func (h *HTTPReporter) awaitStatusQueue(ctx context.Context, submitResp *http.Response) error {
+	var ack reportAck
+	if err := decodeStatusBody(submitResp, &ack); err != nil {
+		return fmt.Errorf("decoding upstream report acknowledgement: %w", err)
+	}
+	// No status URL: the upstream completed the report synchronously despite the queue
+	// being enabled, so there is nothing to poll.
+	if ack.StatusURL == "" {
+		return nil
+	}
+
+	deadline := time.Now().Add(h.EffectiveStatusPollTimeout())
+	for {
+		status, err := h.pollJobStatus(ctx, ack.StatusURL)
+		if err != nil {
+			return err
+		}
+		state := strings.ToLower(strings.TrimSpace(status.Status))
+		switch {
+		case jobSucceeded[state]:
+			return nil
+		case jobFailed[state]:
+			// The upstream processed and refused the report; an identical retry will not
+			// succeed, so surface it as the terminal rejection (the controller remembers
+			// the payload and stops retrying until the policy/Service changes).
+			// TODO(user): if your job failures are usually transient, return a plain error
+			// here instead so the controller keeps requeuing.
+			return fmt.Errorf("%w: job %q %s: %s", ErrUpstreamRejected, ack.JobID, state, statusMessage(status.Message))
+		}
+		// Still queued/running: wait and poll again until the budget is spent.
+		if time.Now().After(deadline) {
+			return fmt.Errorf("upstream report job %q still %q after %s", ack.JobID, state, h.EffectiveStatusPollTimeout())
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(h.EffectiveStatusPollInterval()):
+		}
+	}
+}
+
+// EffectiveStatusPollInterval and EffectiveStatusPollTimeout return the status-queue
+// polling cadence actually in use, falling back to the package defaults when the
+// corresponding field is unset. They let callers log the resolved values.
+func (h *HTTPReporter) EffectiveStatusPollInterval() time.Duration {
+	if h.StatusPollInterval > 0 {
+		return h.StatusPollInterval
+	}
+	return statusQueuePollInterval
+}
+
+func (h *HTTPReporter) EffectiveStatusPollTimeout() time.Duration {
+	if h.StatusPollTimeout > 0 {
+		return h.StatusPollTimeout
+	}
+	return statusQueuePollTimeout
+}
+
+// pollJobStatus issues a single GET to the status URL and decodes the job's state.
+// Status-code classification mirrors send: a 4xx means the status URL itself is bad
+// (terminal rejection), anything else non-2xx is transient so the caller requeues.
+func (h *HTTPReporter) pollJobStatus(ctx context.Context, statusURL string) (jobStatus, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+	if err != nil {
+		return jobStatus{}, fmt.Errorf("building upstream status request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	client := h.Client
+	if client == nil {
+		client = &http.Client{Timeout: defaultTimeout}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return jobStatus{}, fmt.Errorf("polling upstream report status: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		var status jobStatus
+		if err := decodeStatusBody(resp, &status); err != nil {
+			return jobStatus{}, fmt.Errorf("decoding upstream report status: %w", err)
+		}
+		return status, nil
+	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		return jobStatus{}, fmt.Errorf("%w: status URL returned %d: %s",
+			ErrUpstreamRejected, resp.StatusCode, upstreamResponseBody(resp))
+	default:
+		return jobStatus{}, fmt.Errorf("upstream status URL returned unexpected status %d: %s",
+			resp.StatusCode, upstreamResponseBody(resp))
+	}
+}
+
+// decodeStatusBody JSON-decodes a bounded prefix of a status-queue response body into
+// v. The read is capped at maxStatusBodyBytes so an oversized response cannot bloat
+// memory.
+func decodeStatusBody(resp *http.Response, v any) error {
+	return json.NewDecoder(io.LimitReader(resp.Body, maxStatusBodyBytes)).Decode(v)
+}
+
+// statusMessage renders an optional job message for inclusion in an error, collapsing
+// whitespace and substituting a placeholder when empty.
+func statusMessage(msg string) string {
+	msg = strings.Join(strings.Fields(msg), " ")
+	if msg == "" {
+		return "(no message)"
+	}
+	return msg
 }
 
 // maxErrorBodyBytes bounds how much of an error response body is read into an error

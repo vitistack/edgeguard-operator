@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testServiceName is the placeholder Service name used across reporter tests.
@@ -268,4 +269,168 @@ func TestHTTPReporterCABundleErrors(t *testing.T) {
 			t.Fatal("expected an error for a CA bundle with no valid certificates, got nil")
 		}
 	})
+}
+
+// statusQueueReporter builds a reporter pointed at server with the status queue
+// enabled and a fast polling cadence so tests do not wait on real timers.
+func statusQueueReporter(serverURL string) *HTTPReporter {
+	r := NewHTTPReporter(serverURL, false)
+	r.ReportingStatusQueue = true
+	r.StatusPollInterval = time.Millisecond
+	r.StatusPollTimeout = 2 * time.Second
+	return r
+}
+
+// TestStatusQueueDisabledIgnoresBody confirms that with the status queue off, a 2xx
+// submission is final and the (status-URL-bearing) response body is ignored.
+func TestStatusQueueDisabledIgnoresBody(t *testing.T) {
+	var polled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			polled = true
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"statusUrl":"` + "http://unused" + `"}`))
+	}))
+	defer server.Close()
+
+	reporter := NewHTTPReporter(server.URL, false) // status queue disabled
+	if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+		t.Fatalf("ReportPorts: %v", err)
+	}
+	if polled {
+		t.Fatal("status queue disabled, but the reporter polled a status URL")
+	}
+}
+
+// TestStatusQueueSyncCompletion confirms that when the status queue is enabled but the
+// submission returns no status URL, the 2xx is treated as immediate success.
+func TestStatusQueueSyncCompletion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	if err := statusQueueReporter(server.URL).
+		ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+		t.Fatalf("ReportPorts: %v", err)
+	}
+}
+
+// TestStatusQueuePollsToTerminalState drives the poll loop through a pending state to
+// each terminal outcome: success is nil, a failed job is the terminal ErrUpstreamRejected.
+func TestStatusQueuePollsToTerminalState(t *testing.T) {
+	cases := map[string]struct {
+		finalState   string
+		wantErr      bool
+		wantRejected bool
+	}{
+		"completed": {finalState: "completed", wantErr: false},
+		"succeeded": {finalState: "SUCCEEDED", wantErr: false},
+		"failed":    {finalState: "failed", wantErr: true, wantRejected: true},
+		"error":     {finalState: "error", wantErr: true, wantRejected: true},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var polls int
+			mux := http.NewServeMux()
+			mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+				polls++
+				state := "pending"
+				if polls >= 2 { // stay pending once, then settle
+					state = tc.finalState
+				}
+				_, _ = w.Write([]byte(`{"status":"` + state + `","message":"m"}`))
+			})
+			var server *httptest.Server
+			mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"statusUrl":"` + server.URL + `/status","jobId":"j1"}`))
+			})
+			server = httptest.NewServer(mux)
+			defer server.Close()
+
+			err := statusQueueReporter(server.URL).
+				ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected an error for final state %q, got nil", tc.finalState)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected no error for final state %q, got %v", tc.finalState, err)
+			}
+			if got := errors.Is(err, ErrUpstreamRejected); got != tc.wantRejected {
+				t.Fatalf("state %q: errors.Is(err, ErrUpstreamRejected) = %v, want %v (err=%v)",
+					tc.finalState, got, tc.wantRejected, err)
+			}
+			if polls < 2 {
+				t.Fatalf("expected the reporter to poll past the pending state, got %d poll(s)", polls)
+			}
+		})
+	}
+}
+
+// TestStatusQueueTimeout confirms that a job stuck in a non-terminal state past the
+// poll budget yields a transient error (not ErrUpstreamRejected) so the controller
+// requeues and the next attempt resumes the same job.
+func TestStatusQueueTimeout(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"running"}`))
+	})
+	var server *httptest.Server
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"statusUrl":"` + server.URL + `/status","jobId":"j1"}`))
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	reporter := statusQueueReporter(server.URL)
+	reporter.StatusPollTimeout = 50 * time.Millisecond
+	err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
+	if err == nil {
+		t.Fatal("expected a timeout error for a job that never settles, got nil")
+	}
+	if errors.Is(err, ErrUpstreamRejected) {
+		t.Fatalf("a poll timeout should be transient, not a terminal rejection: %v", err)
+	}
+}
+
+// TestStatusQueuePollError confirms a 4xx from the status URL is a terminal rejection
+// while a 5xx is transient, mirroring submission classification.
+func TestStatusQueuePollError(t *testing.T) {
+	cases := map[string]struct {
+		status       int
+		wantRejected bool
+	}{
+		"status URL 400": {status: http.StatusBadRequest, wantRejected: true},
+		"status URL 500": {status: http.StatusInternalServerError, wantRejected: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+			})
+			var server *httptest.Server
+			mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"statusUrl":"` + server.URL + `/status"}`))
+			})
+			server = httptest.NewServer(mux)
+			defer server.Close()
+
+			err := statusQueueReporter(server.URL).
+				ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
+			if err == nil {
+				t.Fatalf("expected an error for status URL returning %d", tc.status)
+			}
+			if got := errors.Is(err, ErrUpstreamRejected); got != tc.wantRejected {
+				t.Fatalf("status %d: errors.Is(err, ErrUpstreamRejected) = %v, want %v (err=%v)",
+					tc.status, got, tc.wantRejected, err)
+			}
+		})
+	}
 }

@@ -171,6 +171,15 @@ type EdgePolicyStatus struct {
 	// +kubebuilder:validation:MaxLength=64
 	RejectedReportKey string `json:"rejectedReportKey,omitempty"`
 
+	// RejectedReportMessage is the human-readable detail from the upstream for the
+	// report named by RejectedReportKey (e.g. the rejection body or the failed queue
+	// job's message). It is surfaced in the UpstreamReady condition message and is
+	// cleared alongside RejectedReportKey once the report content changes or a report
+	// is accepted. Persisted so the detail stays stable across suppressed reconciles.
+	// +optional
+	// +kubebuilder:validation:MaxLength=512
+	RejectedReportMessage string `json:"rejectedReportMessage,omitempty"`
+
 	// Conditions represent the current status of the edge policy.
 	// +optional
 	// +listType=map

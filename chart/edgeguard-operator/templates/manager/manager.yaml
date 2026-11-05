@@ -95,6 +95,15 @@ spec:
         {{- if .apiUrl }}
         {{- $env = append $env (dict "name" "UPSTREAM_API_URL" "value" (.apiUrl | toString)) }}
         {{- end }}
+        {{- if not (kindIs "invalid" .reportingStatusQueue) }}
+        {{- $env = append $env (dict "name" "UPSTREAM_REPORTING_STATUS_QUEUE" "value" (.reportingStatusQueue | toString)) }}
+        {{- end }}
+        {{- if .reportingStatusQueuePollInterval }}
+        {{- $env = append $env (dict "name" "UPSTREAM_REPORTING_STATUS_QUEUE_POLL_INTERVAL" "value" (.reportingStatusQueuePollInterval | toString)) }}
+        {{- end }}
+        {{- if .reportingStatusQueuePollTimeout }}
+        {{- $env = append $env (dict "name" "UPSTREAM_REPORTING_STATUS_QUEUE_POLL_TIMEOUT" "value" (.reportingStatusQueuePollTimeout | toString)) }}
+        {{- end }}
         {{- if not (kindIs "invalid" .reportingDisabled) }}
         {{- $env = append $env (dict "name" "UPSTREAM_REPORTING_DISABLED" "value" (.reportingDisabled | toString)) }}
         {{- end }}

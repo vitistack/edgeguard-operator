@@ -38,6 +38,18 @@ manager:
   ##   - apiUrl: base URL of the upstream IPAM API that receives port reports.
   ##     Leave empty ("") to disable reporting; policies with filter.enabled: true
   ##     then report UpstreamReady=False/UpstreamNotConfigured.
+  ##   - reportingStatusQueue: set to "true" to enable the asynchronous status queue.
+  ##     When enabled, an accepted report is not treated as final: the upstream API
+  ##     returns a status URL that the manager polls until the queued job reports
+  ##     completion (success) or failure. Leave "false" to treat any accepted report
+  ##     as immediately delivered.
+  ##   - reportingStatusQueuePollInterval: delay between polls of a report's status URL
+  ##     while the queued job is still pending (Go duration, e.g. "2s", "500ms"). Leave
+  ##     empty ("") to use the built-in default. Only used when reportingStatusQueue is true.
+  ##   - reportingStatusQueuePollTimeout: how long one report attempt polls the status URL
+  ##     for a terminal state before giving up and letting the controller requeue (Go
+  ##     duration, e.g. "30s", "2m"). Leave empty ("") to use the built-in default. Only
+  ##     used when reportingStatusQueue is true.
   ##   - reportingDisabled: set to "true" to treat every report as delivered without
   ##     any outbound call (takes precedence over apiUrl).
   ##   - insecureSkipVerify: set to "true" to skip upstream TLS certificate
@@ -45,7 +57,10 @@ manager:
   ##     only; do not enable in production.
   ##
   upstream:
-    apiUrl: "https://edgeguard-api.vitistack.io/v1"
+    apiUrl: "https://edgeguard-api.vitistack.io"
+    reportingStatusQueue: "true"
+    reportingStatusQueuePollInterval: ""
+    reportingStatusQueuePollTimeout: ""
     reportingDisabled: "false"
     insecureSkipVerify: "false"
 

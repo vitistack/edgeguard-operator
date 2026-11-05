@@ -306,6 +306,15 @@ spec:
                   it is cleared once the report content changes or a report is accepted.
                 maxLength: 64
                 type: string
+              rejectedReportMessage:
+                description: |-
+                  RejectedReportMessage is the human-readable detail from the upstream for the
+                  report named by RejectedReportKey (e.g. the rejection body or the failed queue
+                  job's message). It is surfaced in the UpstreamReady condition message and is
+                  cleared alongside RejectedReportKey once the report content changes or a report
+                  is accepted. Persisted so the detail stays stable across suppressed reconciles.
+                maxLength: 512
+                type: string
             type: object
         required:
         - spec

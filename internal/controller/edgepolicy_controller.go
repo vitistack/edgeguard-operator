@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -97,6 +98,26 @@ const (
 // suppressed reconcile reach a quiet fixpoint instead of rewriting the status. The
 // concrete status code is logged rather than stored on the condition.
 const rejectedReportMessage = "Upstream rejected the report; not retried until the report content changes"
+
+// maxRejectionDetailLen bounds the upstream rejection detail stored on the status (and
+// thus the condition message), so a large upstream response body cannot bloat the object.
+const maxRejectionDetailLen = 512
+
+// upstreamRejectionDetail extracts the human-readable detail from a terminal upstream
+// rejection error for display on the status: it strips the ErrUpstreamRejected sentinel
+// prefix, collapses whitespace onto one line, and truncates (rune-safe) to
+// maxRejectionDetailLen. It returns "" for a nil error.
+func upstreamRejectionDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	detail := strings.TrimPrefix(err.Error(), upstream.ErrUpstreamRejected.Error()+": ")
+	detail = strings.Join(strings.Fields(detail), " ")
+	if r := []rune(detail); len(r) > maxRejectionDetailLen {
+		detail = string(r[:maxRejectionDetailLen])
+	}
+	return detail
+}
 
 // errReportSuppressed signals that a report identical to one the upstream already
 // rejected (same idempotency key) was withheld rather than re-sent.
@@ -319,8 +340,9 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 		// forget any remembered rejection.
 		secretChanged = meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeIpamSecretReady)
 		upstreamChanged = meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeUpstreamReady)
-		if policy.Status.RejectedReportKey != "" {
+		if policy.Status.RejectedReportKey != "" || policy.Status.RejectedReportMessage != "" {
 			policy.Status.RejectedReportKey = ""
+			policy.Status.RejectedReportMessage = ""
 			upstreamChanged = true
 		}
 	}
@@ -342,8 +364,10 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 				// changed report produces a different key and is attempted afresh.
 				return r.markReportRejected(ctx, policy, secretChanged || upstreamChanged)
 			case errors.Is(err, upstream.ErrUpstreamRejected):
-				// Remember the rejected payload so an identical retry is suppressed.
+				// Remember the rejected payload so an identical retry is suppressed, and the
+				// upstream's detail so the terminal status explains why.
 				policy.Status.RejectedReportKey = key
+				policy.Status.RejectedReportMessage = upstreamRejectionDetail(err)
 				return r.handleReportFailure(ctx, policy, err, secretChanged || upstreamChanged)
 			case err != nil:
 				// Missing required fields (UpstreamReportIncomplete) or a transient
@@ -354,6 +378,7 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 			// Accepted: forget any prior rejection and clear the UpstreamReady condition
 			// so the status reads healthy again.
 			policy.Status.RejectedReportKey = ""
+			policy.Status.RejectedReportMessage = ""
 			if meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeUpstreamReady) {
 				upstreamChanged = true
 			}
@@ -867,18 +892,23 @@ func setUpstreamIncompleteCondition(policy *securityv1alpha1.EdgePolicy, reportE
 }
 
 // setUpstreamRejectedCondition marks UpstreamReady as False/UpstreamReportRejected
-// when the upstream refused the report with a 4xx client error. Unlike a transient
-// failure this is terminal: the controller stops retrying on the timer and re-attempts
-// only when the report content changes. It uses a fixed message (not the error detail)
-// so a fresh rejection and a later suppressed reconcile produce byte-identical
-// conditions, letting the status reach a quiet fixpoint. It returns whether the status
-// changed.
+// when the upstream refused the report with a 4xx client error (or a failed status-queue
+// job). Unlike a transient failure this is terminal: the controller stops retrying on the
+// timer and re-attempts only when the report content changes. The message is the fixed
+// rejectedReportMessage plus the upstream's detail persisted in status.RejectedReportMessage,
+// so it stays byte-identical between a fresh rejection and a later suppressed reconcile
+// (both read the same persisted detail), letting the status reach a quiet fixpoint while
+// still surfacing why the report was rejected. It returns whether the status changed.
 func setUpstreamRejectedCondition(policy *securityv1alpha1.EdgePolicy) bool {
+	message := rejectedReportMessage
+	if detail := policy.Status.RejectedReportMessage; detail != "" {
+		message = fmt.Sprintf("%s: %s", rejectedReportMessage, detail)
+	}
 	return meta.SetStatusCondition(&policy.Status.Conditions, metav1.Condition{
 		Type:               conditionTypeUpstreamReady,
 		Status:             metav1.ConditionFalse,
 		Reason:             reasonUpstreamRejected,
-		Message:            rejectedReportMessage,
+		Message:            message,
 		ObservedGeneration: policy.Generation,
 	})
 }

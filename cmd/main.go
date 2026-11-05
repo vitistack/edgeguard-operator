@@ -21,6 +21,7 @@ import (
 	"flag"
 	"os"
 	"strconv"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -64,6 +65,17 @@ func envBool(name string) bool {
 	return err == nil && v
 }
 
+// envDuration reads a Go duration environment variable (e.g. "2s", "500ms", "1m").
+// An unset or unparseable value yields the supplied default, so a typo falls back to
+// the built-in cadence rather than silently disabling the budget.
+func envDuration(name string, def time.Duration) time.Duration {
+	v, err := time.ParseDuration(os.Getenv(name))
+	if err != nil {
+		return def
+	}
+	return v
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
@@ -78,6 +90,9 @@ func main() {
 	var disableUpstreamReporting bool
 	var upstreamInsecureSkipVerify bool
 	var upstreamCABundle string
+	var upstreamReportingStatusQueue bool
+	var upstreamStatusQueuePollInterval time.Duration
+	var upstreamStatusQueuePollTimeout time.Duration
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -113,6 +128,23 @@ func main() {
 		"Path to a PEM CA bundle to trust (in addition to the system store) when verifying the "+
 			"upstream TLS certificate, for upstreams fronted by a private/internal CA. Defaults to the "+
 			"UPSTREAM_CA_BUNDLE environment variable. Ignored when --upstream-insecure-skip-verify is set.")
+	flag.BoolVar(&upstreamReportingStatusQueue, "upstream-reporting-status-queue",
+		envBool("UPSTREAM_REPORTING_STATUS_QUEUE"),
+		"If set, an accepted report is not treated as final: the upstream is expected to return a "+
+			"status URL, which the operator polls until the queued job reports completion or failure. "+
+			"Defaults to the UPSTREAM_REPORTING_STATUS_QUEUE environment variable. Ignored when "+
+			"--disable-upstream-reporting is set.")
+	flag.DurationVar(&upstreamStatusQueuePollInterval, "upstream-reporting-status-queue-poll-interval",
+		envDuration("UPSTREAM_REPORTING_STATUS_QUEUE_POLL_INTERVAL", 0),
+		"Delay between polls of a report's status URL while the queued job is still pending "+
+			"(e.g. 2s, 500ms). Defaults to the UPSTREAM_REPORTING_STATUS_QUEUE_POLL_INTERVAL environment "+
+			"variable, or the built-in default when unset. Only used with --upstream-reporting-status-queue.")
+	flag.DurationVar(&upstreamStatusQueuePollTimeout, "upstream-reporting-status-queue-poll-timeout",
+		envDuration("UPSTREAM_REPORTING_STATUS_QUEUE_POLL_TIMEOUT", 0),
+		"How long one report attempt polls the status URL for a terminal state before giving up and "+
+			"letting the controller requeue (e.g. 30s, 2m). Defaults to the "+
+			"UPSTREAM_REPORTING_STATUS_QUEUE_POLL_TIMEOUT environment variable, or the built-in default "+
+			"when unset. Only used with --upstream-reporting-status-queue.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -245,6 +277,14 @@ func main() {
 			setupLog.Info("Upstream port reporting enabled", "upstream-url", upstreamURL)
 		} else {
 			setupLog.Info("Upstream port reporting not configured (UPSTREAM_API_URL is empty)")
+		}
+		httpReporter.ReportingStatusQueue = upstreamReportingStatusQueue
+		if upstreamReportingStatusQueue {
+			httpReporter.StatusPollInterval = upstreamStatusQueuePollInterval
+			httpReporter.StatusPollTimeout = upstreamStatusQueuePollTimeout
+			setupLog.Info("Upstream reporting status queue enabled; polling each report's status URL for completion",
+				"pollInterval", httpReporter.EffectiveStatusPollInterval(),
+				"pollTimeout", httpReporter.EffectiveStatusPollTimeout())
 		}
 		if upstreamInsecureSkipVerify {
 			setupLog.Info("Upstream TLS verification disabled (UPSTREAM_INSECURE_SKIP_VERIFY); " +
