@@ -29,6 +29,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // defaultTimeout bounds a single upstream request.
@@ -342,6 +344,9 @@ func (h *HTTPReporter) awaitStatusQueue(ctx context.Context, submitResp *http.Re
 		return nil
 	}
 
+	log := logf.FromContext(ctx)
+	log.Info("Queued upstream report job", "jobId", ack.JobID, "statusUrl", ack.StatusURL)
+
 	deadline := time.Now().Add(h.EffectiveStatusPollTimeout())
 	for {
 		status, err := h.pollJobStatus(ctx, ack.StatusURL)
@@ -351,6 +356,7 @@ func (h *HTTPReporter) awaitStatusQueue(ctx context.Context, submitResp *http.Re
 		state := strings.ToLower(strings.TrimSpace(status.Status))
 		switch {
 		case jobSucceeded[state]:
+			log.Info("Upstream report job completed", "jobId", ack.JobID, "status", state)
 			return nil
 		case jobFailed[state]:
 			// The upstream processed and refused the report; an identical retry will not
