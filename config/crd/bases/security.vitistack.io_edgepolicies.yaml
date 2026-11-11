@@ -298,6 +298,152 @@ spec:
                 maxItems: 256
                 type: array
                 x-kubernetes-list-type: atomic
+              pendingReport:
+                description: |-
+                  PendingReport tracks an upstream report that was accepted for asynchronous
+                  processing (the status-queue flow) and whose outcome is still being polled. It is
+                  nil when no report is in flight. While set, the controller polls the job's status
+                  URL once per reconcile (instead of blocking or re-submitting) and requeues until
+                  the job reaches a terminal state, so a reconcile worker is never held waiting on
+                  the upstream.
+                properties:
+                  ips:
+                    description: |-
+                      IPs is the set of load balancer ingress addresses captured when the report was
+                      submitted, recorded as ObservedIPs once the job completes successfully.
+                    items:
+                      maxLength: 45
+                      type: string
+                    maxItems: 256
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  jobId:
+                    description: JobID identifies the queued job upstream, for logging
+                      and correlation.
+                    maxLength: 256
+                    type: string
+                  key:
+                    description: |-
+                      Key is the idempotency key of the submitted report. When the desired report's
+                      key no longer matches (the policy or its target Service changed while the job was
+                      in flight), the pending job is stale and a fresh report is submitted instead of
+                      polling it.
+                    maxLength: 64
+                    type: string
+                  ports:
+                    description: |-
+                      Ports is the set of discovered ports captured when the report was submitted.
+                      It is recorded as ObservedPorts once the job completes successfully, so
+                      ObservedPorts only ever reflects a report the upstream durably accepted.
+                    items:
+                      description: ObservedPort describes a port discovered on the
+                        target Service.
+                      properties:
+                        name:
+                          description: Name is the name of the Service port, if one
+                            is set.
+                          maxLength: 63
+                          type: string
+                        port:
+                          description: Port is the port number exposed by the Service.
+                          format: int32
+                          type: integer
+                        protocol:
+                          description: Protocol is the IP protocol for this port (TCP,
+                            UDP, or SCTP).
+                          enum:
+                          - TCP
+                          - UDP
+                          - SCTP
+                          type: string
+                      required:
+                      - port
+                      type: object
+                    maxItems: 256
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  statusUrl:
+                    description: StatusURL is the upstream URL polled for the queued
+                      job's outcome.
+                    maxLength: 2048
+                    type: string
+                required:
+                - key
+                - statusUrl
+                type: object
+              pendingWithdrawal:
+                description: |-
+                  PendingWithdrawal tracks an upstream withdrawal (DELETE) that was accepted for
+                  asynchronous processing and whose outcome is still being polled. It is nil when no
+                  withdrawal is in flight. While set, the controller holds the relevant finalizer
+                  and polls the job's status URL once per reconcile until it completes, so deletion
+                  never blocks a worker and the finalizer is released only once the upstream has
+                  durably withdrawn the report.
+                properties:
+                  ips:
+                    description: |-
+                      IPs is the set of load balancer ingress addresses captured when the report was
+                      submitted, recorded as ObservedIPs once the job completes successfully.
+                    items:
+                      maxLength: 45
+                      type: string
+                    maxItems: 256
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  jobId:
+                    description: JobID identifies the queued job upstream, for logging
+                      and correlation.
+                    maxLength: 256
+                    type: string
+                  key:
+                    description: |-
+                      Key is the idempotency key of the submitted report. When the desired report's
+                      key no longer matches (the policy or its target Service changed while the job was
+                      in flight), the pending job is stale and a fresh report is submitted instead of
+                      polling it.
+                    maxLength: 64
+                    type: string
+                  ports:
+                    description: |-
+                      Ports is the set of discovered ports captured when the report was submitted.
+                      It is recorded as ObservedPorts once the job completes successfully, so
+                      ObservedPorts only ever reflects a report the upstream durably accepted.
+                    items:
+                      description: ObservedPort describes a port discovered on the
+                        target Service.
+                      properties:
+                        name:
+                          description: Name is the name of the Service port, if one
+                            is set.
+                          maxLength: 63
+                          type: string
+                        port:
+                          description: Port is the port number exposed by the Service.
+                          format: int32
+                          type: integer
+                        protocol:
+                          description: Protocol is the IP protocol for this port (TCP,
+                            UDP, or SCTP).
+                          enum:
+                          - TCP
+                          - UDP
+                          - SCTP
+                          type: string
+                      required:
+                      - port
+                      type: object
+                    maxItems: 256
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  statusUrl:
+                    description: StatusURL is the upstream URL polled for the queued
+                      job's outcome.
+                    maxLength: 2048
+                    type: string
+                required:
+                - key
+                - statusUrl
+                type: object
               rejectedReportKey:
                 description: |-
                   RejectedReportKey is the idempotency key of the last report the upstream

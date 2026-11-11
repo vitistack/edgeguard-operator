@@ -29,28 +29,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // defaultTimeout bounds a single upstream request.
 const defaultTimeout = 10 * time.Second
 
-const (
-	// statusQueuePollInterval is the delay between successive polls of a report's
-	// status URL within a single report attempt.
-	statusQueuePollInterval = 2 * time.Second
-	// statusQueuePollTimeout bounds how long one report attempt waits for the queued
-	// job to reach a terminal state before giving up. Exceeding it is surfaced as a
-	// transient error so the controller requeues; because the report carries a stable
-	// Idempotency-Key, the re-submission on the next reconcile resolves to the same
-	// job and polling resumes rather than duplicating work. Keep this comfortably
-	// below the controller's reconcile expectations so a worker is not held too long.
-	statusQueuePollTimeout = 30 * time.Second
-	// maxStatusBodyBytes bounds how much of a status-queue response body is read and
-	// decoded, so a large (or hostile) upstream response cannot bloat memory.
-	maxStatusBodyBytes = 64 << 10 // 64 KiB
-)
+// maxStatusBodyBytes bounds how much of a status-queue response body is read and
+// decoded, so a large (or hostile) upstream response cannot bloat memory.
+const maxStatusBodyBytes = 64 << 10 // 64 KiB
 
 // HTTPReporter is a scaffold Reporter that POSTs port reports to an external
 // HTTP API as JSON.
@@ -71,21 +57,16 @@ type HTTPReporter struct {
 	InsecureSkipVerify bool
 	// ReportingStatusQueue enables the asynchronous status-queue flow. When true, a
 	// 2xx submission is not treated as final: the upstream is expected to return a
-	// status URL in the response body, which this reporter then polls until the queued
-	// job reports completion or failure (see awaitStatusQueue). It is opt-in via the
-	// UPSTREAM_REPORTING_STATUS_QUEUE environment variable. When false, any 2xx
-	// response counts as immediate success and the body is ignored.
+	// status URL in the response body. For a report, ReportPorts returns that URL as a
+	// Pending ReportStatus and the controller polls it via PollReport across reconciles;
+	// for a withdrawal, DeletePorts returns Pending the same way and the controller
+	// polls it (holding its finalizer) until the job completes. Both are non-blocking.
+	// It is opt-in via the UPSTREAM_REPORTING_STATUS_QUEUE environment variable. When
+	// false, any 2xx response counts as immediate success and the body is ignored.
 	ReportingStatusQueue bool
 	// Client is the HTTP client used for requests. If nil, a client with
 	// defaultTimeout is used.
 	Client *http.Client
-	// StatusPollInterval and StatusPollTimeout override the status-queue polling
-	// cadence: the delay between polls of a report's status URL and the total budget
-	// one report attempt waits for a terminal state. When zero the statusQueuePoll*
-	// package defaults apply. They are sourced from the
-	// UPSTREAM_REPORTING_STATUS_QUEUE_POLL_INTERVAL / _TIMEOUT environment variables.
-	StatusPollInterval time.Duration
-	StatusPollTimeout  time.Duration
 }
 
 // NewHTTPReporter builds an HTTPReporter for the given base URL. A zero-value
@@ -212,27 +193,102 @@ func (h *HTTPReporter) Configured() bool {
 	return h.BaseURL != ""
 }
 
-// ReportPorts implements Reporter by POSTing the report as JSON to
-// <BaseURL>.
+// ReportPorts implements Reporter by POSTing the report as JSON to <BaseURL> with a
+// single round-trip. With the status queue disabled, any 2xx is immediate success
+// (ReportStatus{Done}). With it enabled, a 2xx means the job was accepted: the
+// upstream returns a status URL which the controller polls via PollReport on a later
+// reconcile, so no worker is held waiting here. A 2xx with no status URL is treated as
+// synchronous success.
 //
 // TODO(user): This is scaffolding. Validate the endpoint path, auth, and
 // response handling against the real upstream service before relying on it.
-func (h *HTTPReporter) ReportPorts(ctx context.Context, report PortReport) error {
-	return h.send(ctx, http.MethodPost, report)
+func (h *HTTPReporter) ReportPorts(ctx context.Context, report PortReport) (ReportStatus, error) {
+	resp, err := h.submit(ctx, http.MethodPost, report)
+	if err != nil {
+		return ReportStatus{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Without the status queue the 2xx is final. With it, the 2xx only means the job
+	// was queued; its real outcome is polled from the status URL by the controller.
+	if !h.ReportingStatusQueue {
+		return ReportStatus{Done: true}, nil
+	}
+	return ackToStatus(resp)
 }
 
-// DeletePorts implements Reporter by sending an HTTP DELETE with the report body
-// to <BaseURL>, withdrawing a previously reported port set when the
-// policy or its target Service is removed.
-func (h *HTTPReporter) DeletePorts(ctx context.Context, report PortReport) error {
-	return h.send(ctx, http.MethodDelete, report)
+// PollReport implements Reporter by performing a single poll of a queued report's
+// status URL. It maps the job's state onto the Reporter error contract: Done on
+// success, the terminal ErrUpstreamRejected when the job failed, a plain transient
+// error on a poll failure (so the controller requeues and polls again), or a still-in-
+// flight ReportStatus (Pending, carrying the same status URL) while the job runs. It is
+// shared by report and withdrawal jobs, which poll the same status-URL contract.
+func (h *HTTPReporter) PollReport(ctx context.Context, statusURL string) (ReportStatus, error) {
+	status, err := h.pollJobStatus(ctx, statusURL)
+	if err != nil {
+		return ReportStatus{}, err
+	}
+	state := strings.ToLower(strings.TrimSpace(status.Status))
+	switch {
+	case jobSucceeded[state]:
+		return ReportStatus{Done: true}, nil
+	case jobFailed[state]:
+		// The upstream processed and refused the report; an identical retry will not
+		// succeed, so surface it as the terminal rejection.
+		// TODO(user): if your job failures are usually transient, return a plain error
+		// here instead so the controller keeps requeuing.
+		return ReportStatus{}, fmt.Errorf("%w: job %s: %s", ErrUpstreamRejected, state, statusMessage(status.Message))
+	default:
+		// Still queued/running: report it as pending so the controller requeues and polls
+		// again, without blocking a worker here.
+		return ReportStatus{StatusURL: statusURL}, nil
+	}
 }
 
-// send marshals the report and issues a single request to the port-reports
-// endpoint with the given HTTP method.
-func (h *HTTPReporter) send(ctx context.Context, method string, report PortReport) error {
+// DeletePorts implements Reporter by sending an HTTP DELETE with the report body to
+// <BaseURL>, withdrawing a previously reported port set when the policy or its target
+// Service is removed. Like ReportPorts it is a single round-trip: with the status queue
+// enabled a 2xx carrying a status URL is returned as a Pending ReportStatus that the
+// controller polls via PollReport across reconciles — holding its finalizer until the
+// withdrawal job completes — rather than blocking a worker here.
+func (h *HTTPReporter) DeletePorts(ctx context.Context, report PortReport) (ReportStatus, error) {
+	resp, err := h.submit(ctx, http.MethodDelete, report)
+	if err != nil {
+		return ReportStatus{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if !h.ReportingStatusQueue {
+		return ReportStatus{Done: true}, nil
+	}
+	return ackToStatus(resp)
+}
+
+// ackToStatus decodes a queued-submission acknowledgement into a ReportStatus: Done
+// when the upstream completed synchronously (no status URL in the body), or a Pending
+// status carrying the status URL and job ID the controller polls. It backs the status-
+// queue branch of both ReportPorts and DeletePorts.
+func ackToStatus(resp *http.Response) (ReportStatus, error) {
+	var ack reportAck
+	if err := decodeStatusBody(resp, &ack); err != nil {
+		return ReportStatus{}, fmt.Errorf("decoding upstream acknowledgement: %w", err)
+	}
+	if ack.StatusURL == "" {
+		return ReportStatus{Done: true}, nil
+	}
+	return ReportStatus{StatusURL: ack.StatusURL, JobID: ack.JobID}, nil
+}
+
+// submit marshals the report and issues a single request to the port-reports endpoint
+// with the given HTTP method. On a 2xx it returns the live response (the caller must
+// close its body). Any non-2xx is classified and returned as an error: a 404 is
+// ErrUpstreamNotFound (which wraps ErrUpstreamRejected so a report still treats it as
+// terminal while a withdrawal can single out the already-gone case), any other 4xx is
+// the terminal ErrUpstreamRejected, and anything else (5xx, redirects) is a transient
+// failure the controller retries. The upstream's response body is included in the
+// error to aid debugging a rejection.
+func (h *HTTPReporter) submit(ctx context.Context, method string, report PortReport) (*http.Response, error) {
 	if h.BaseURL == "" {
-		return fmt.Errorf("upstream HTTPReporter has no BaseURL configured")
+		return nil, fmt.Errorf("upstream HTTPReporter has no BaseURL configured")
 	}
 
 	// The upstream expects ipv4Addresses and ipv6Addresses to always be present as
@@ -248,19 +304,21 @@ func (h *HTTPReporter) send(ctx context.Context, method string, report PortRepor
 
 	body, err := json.Marshal(report)
 	if err != nil {
-		return fmt.Errorf("marshaling port report: %w", err)
+		return nil, fmt.Errorf("marshaling port report: %w", err)
 	}
 
 	// TODO(user): confirm the real endpoint path and method.
 	endpoint := h.BaseURL
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("building upstream request: %w", err)
+		return nil, fmt.Errorf("building upstream request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// Idempotency-Key lets the upstream dedupe retries and duplicates (e.g. a
-	// report re-sent after a reconcile conflict): identical policy/ports/IPs yield
-	// the same key. TODO(user): confirm the header name the upstream expects.
+	// report re-sent after a reconcile conflict, or a submission resumed across
+	// reconciles): identical policy/ports/IPs yield the same key, so the re-submission
+	// resolves to the same queued job rather than duplicating work.
+	// TODO(user): confirm the header name the upstream expects.
 	req.Header.Set("Idempotency-Key", report.IdempotencyKey())
 
 	client := h.Client
@@ -270,31 +328,21 @@ func (h *HTTPReporter) send(ctx context.Context, method string, report PortRepor
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("sending port report upstream: %w", err)
+		return nil, fmt.Errorf("sending port report upstream: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
 
-	// Any 2xx status counts as the report being accepted. A 404 is singled out as
-	// ErrUpstreamNotFound (it wraps ErrUpstreamRejected) so a withdrawal can treat it as
-	// already-gone; any other 4xx is the terminal ErrUpstreamRejected. Anything else
-	// (5xx, redirects, ...) is a transient failure the controller surfaces and retries.
-	// The upstream's response body is included in the error (and thus the log) to aid
-	// debugging a rejection.
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		// Accepted. Without the status queue the report is done; with it, the 2xx only
-		// means the job was queued and its real outcome is polled from the status URL.
-		if !h.ReportingStatusQueue {
-			return nil
-		}
-		return h.awaitStatusQueue(ctx, resp)
+		return resp, nil
 	case resp.StatusCode == http.StatusNotFound:
-		return fmt.Errorf("%w: status 404: %s", ErrUpstreamNotFound, upstreamResponseBody(resp))
+		err = fmt.Errorf("%w: status 404: %s", ErrUpstreamNotFound, upstreamResponseBody(resp))
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		return fmt.Errorf("%w: status %d: %s", ErrUpstreamRejected, resp.StatusCode, upstreamResponseBody(resp))
+		err = fmt.Errorf("%w: status %d: %s", ErrUpstreamRejected, resp.StatusCode, upstreamResponseBody(resp))
 	default:
-		return fmt.Errorf("upstream returned unexpected status %d: %s", resp.StatusCode, upstreamResponseBody(resp))
+		err = fmt.Errorf("upstream returned unexpected status %d: %s", resp.StatusCode, upstreamResponseBody(resp))
 	}
+	_ = resp.Body.Close()
+	return nil, err
 }
 
 // reportAck is the upstream's response to an accepted report when the status queue
@@ -327,76 +375,8 @@ var (
 	jobFailed    = map[string]bool{"failed": true, "failure": true, "error": true, "rejected": true, "cancelled": true, "canceled": true}
 )
 
-// awaitStatusQueue polls the status URL returned by an accepted submission until the
-// queued job reaches a terminal state or the per-attempt budget is exhausted. It maps
-// the outcome onto the same error contract as a synchronous report: nil on success,
-// ErrUpstreamRejected (terminal) when the job failed, and a plain transient error on a
-// poll failure or timeout so the controller requeues and the next attempt resumes the
-// same job via the report's Idempotency-Key.
-func (h *HTTPReporter) awaitStatusQueue(ctx context.Context, submitResp *http.Response) error {
-	var ack reportAck
-	if err := decodeStatusBody(submitResp, &ack); err != nil {
-		return fmt.Errorf("decoding upstream report acknowledgement: %w", err)
-	}
-	// No status URL: the upstream completed the report synchronously despite the queue
-	// being enabled, so there is nothing to poll.
-	if ack.StatusURL == "" {
-		return nil
-	}
-
-	log := logf.FromContext(ctx)
-	log.Info("Queued upstream report job", "jobId", ack.JobID, "statusUrl", ack.StatusURL)
-
-	deadline := time.Now().Add(h.EffectiveStatusPollTimeout())
-	for {
-		status, err := h.pollJobStatus(ctx, ack.StatusURL)
-		if err != nil {
-			return err
-		}
-		state := strings.ToLower(strings.TrimSpace(status.Status))
-		switch {
-		case jobSucceeded[state]:
-			log.Info("Upstream report job completed", "jobId", ack.JobID, "status", state)
-			return nil
-		case jobFailed[state]:
-			// The upstream processed and refused the report; an identical retry will not
-			// succeed, so surface it as the terminal rejection (the controller remembers
-			// the payload and stops retrying until the policy/Service changes).
-			// TODO(user): if your job failures are usually transient, return a plain error
-			// here instead so the controller keeps requeuing.
-			return fmt.Errorf("%w: job %q %s: %s", ErrUpstreamRejected, ack.JobID, state, statusMessage(status.Message))
-		}
-		// Still queued/running: wait and poll again until the budget is spent.
-		if time.Now().After(deadline) {
-			return fmt.Errorf("upstream report job %q still %q after %s", ack.JobID, state, h.EffectiveStatusPollTimeout())
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(h.EffectiveStatusPollInterval()):
-		}
-	}
-}
-
-// EffectiveStatusPollInterval and EffectiveStatusPollTimeout return the status-queue
-// polling cadence actually in use, falling back to the package defaults when the
-// corresponding field is unset. They let callers log the resolved values.
-func (h *HTTPReporter) EffectiveStatusPollInterval() time.Duration {
-	if h.StatusPollInterval > 0 {
-		return h.StatusPollInterval
-	}
-	return statusQueuePollInterval
-}
-
-func (h *HTTPReporter) EffectiveStatusPollTimeout() time.Duration {
-	if h.StatusPollTimeout > 0 {
-		return h.StatusPollTimeout
-	}
-	return statusQueuePollTimeout
-}
-
 // pollJobStatus issues a single GET to the status URL and decodes the job's state.
-// Status-code classification mirrors send: a 4xx means the status URL itself is bad
+// Status-code classification mirrors submit: a 4xx means the status URL itself is bad
 // (terminal rejection), anything else non-2xx is transient so the caller requeues.
 func (h *HTTPReporter) pollJobStatus(ctx context.Context, statusURL string) (jobStatus, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)

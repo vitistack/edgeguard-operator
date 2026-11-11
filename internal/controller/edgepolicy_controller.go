@@ -62,6 +62,20 @@ const edgePolicyFinalizer = "security.vitistack.io/edgepolicy-finalizer"
 // stack trace, since they are expected and self-healing.
 const upstreamRetryInterval = 30 * time.Second
 
+// conflictRequeueInterval is how soon to requeue after an optimistic-concurrency
+// conflict. A conflict means our cached copy was stale, so we re-fetch and retry
+// promptly rather than surfacing a noisy error. Requeuing here is essential for the
+// upstream status-queue polling retry: its own RequeueAfter would otherwise be
+// discarded when the status write conflicts, and because a status-only write is
+// suppressed by edgePolicyReconcilePredicate no event re-enqueues the policy, so
+// polling of a still-pending job would silently stall until the next resync.
+const conflictRequeueInterval = time.Second
+
+// defaultUpstreamPollInterval is how long to wait before polling an in-flight upstream
+// report job again, when the reconciler's UpstreamPollInterval is unset. Polling is
+// driven by requeues (not a blocking loop), so this is the controller's poll cadence.
+const defaultUpstreamPollInterval = 2 * time.Second
+
 // Condition types and reasons reported on the EdgePolicy status.
 const (
 	// conditionTypeReady summarizes whether the policy's target Service is protected.
@@ -90,6 +104,7 @@ const (
 	reasonUpstreamReportFailed  = "UpstreamReportFailed"
 	reasonUpstreamIncomplete    = "UpstreamReportIncomplete"
 	reasonUpstreamRejected      = "UpstreamReportRejected"
+	reasonUpstreamPending       = "UpstreamReportPending"
 )
 
 // rejectedReportMessage is the stable status message used whenever a report is in the
@@ -119,10 +134,6 @@ func upstreamRejectionDetail(err error) string {
 	return detail
 }
 
-// errReportSuppressed signals that a report identical to one the upstream already
-// rejected (same idempotency key) was withheld rather than re-sent.
-var errReportSuppressed = errors.New("report suppressed: unchanged since the upstream rejected it")
-
 // zoneAnnotation, when present on the target Service, carries the IPAM zone reported upstream.
 const zoneAnnotation = "ipam.vitistack.io/zone"
 
@@ -148,6 +159,11 @@ type EdgePolicyReconciler struct {
 	// Reporter publishes discovered Service ports to an external system. When nil,
 	// upstream reporting is skipped.
 	Reporter upstream.Reporter
+	// UpstreamPollInterval overrides how long to wait before polling an in-flight
+	// upstream report job again. When zero, defaultUpstreamPollInterval applies. It is
+	// sourced from the status-queue poll-interval flag/env so the controller's poll
+	// cadence stays configurable.
+	UpstreamPollInterval time.Duration
 }
 
 // +kubebuilder:rbac:groups=security.vitistack.io,resources=edgepolicies,verbs=get;list;watch;create;update;patch;delete
@@ -184,8 +200,12 @@ func (r *EdgePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	defer func() {
 		switch {
 		case apierrors.IsConflict(err):
-			log.V(1).Info("Reconcile hit an update conflict; retrying on next event", "conflict", err.Error())
-			result, err = ctrl.Result{}, nil
+			// Requeue (quietly, without the error's stack trace) rather than dropping the
+			// request: a status-only write is suppressed by edgePolicyReconcilePredicate, so
+			// no event would otherwise re-enqueue us and an in-flight retry (e.g. upstream
+			// status-queue polling) would stall.
+			log.V(1).Info("Reconcile hit an update conflict; requeuing", "conflict", err.Error())
+			result, err = ctrl.Result{RequeueAfter: conflictRequeueInterval}, nil
 		case apierrors.IsNotFound(err):
 			log.Info("EdgePolicy was deleted during reconcile; nothing to do", "detail", err.Error())
 			result, err = ctrl.Result{}, nil
@@ -203,29 +223,20 @@ func (r *EdgePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// finalizer, then drop our own.
 	if !policy.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&policy, edgePolicyFinalizer) {
-			// Withdraw the policy's ports upstream before we let the object go. Only a 2xx
-			// (or a 404, meaning the upstream has no record of the report — already gone)
-			// confirms the withdrawal; any other 4xx rejection or a 5xx/transport failure
-			// holds the finalizer and requeues so the delete is retried rather than leaving
-			// stale upstream state. The further exception is a withdrawal we cannot even
-			// form (missing credential or addresses, e.g. the target Service is already
-			// gone): no request is sent, so there is nothing upstream to confirm and
-			// deletion proceeds rather than wedging on a precondition retrying cannot meet.
-			if err := r.deletePortsUpstream(ctx, &policy, policy.Spec.TargetRef.Name); err != nil {
-				switch {
-				case errors.Is(err, upstream.ErrUpstreamNotFound):
-					log.Info("Upstream had no record of the report during deletion; treating as already withdrawn",
-						"edgepolicy", policy.Name, "detail", err.Error())
-				case errors.Is(err, upstream.ErrIncompleteReport):
-					log.Info("Skipped upstream withdrawal during deletion; required fields missing",
-						"edgepolicy", policy.Name, "detail", err.Error())
-				default:
-					// Upstream refused (non-404 4xx) or could not be reached (5xx/transport):
-					// hold the finalizer and retry until the withdrawal is accepted.
-					log.Info("Could not withdraw ports upstream during deletion; will retry",
-						"edgepolicy", policy.Name, "retryAfter", upstreamRetryInterval.String(), "error", err.Error())
-					return ctrl.Result{RequeueAfter: upstreamRetryInterval}, nil
-				}
+			// Withdraw the policy's ports upstream before we let the object go. The
+			// withdrawal is non-blocking: a queued job is recorded on status and polled on
+			// later reconciles (holding this finalizer) until it completes. Only a
+			// confirmed withdrawal — a 2xx/completed job, a 404 (the upstream has no record,
+			// already gone), or a withdrawal we cannot even form (missing credential or
+			// addresses, e.g. the target Service is already gone) — releases the finalizer;
+			// a refusal or an unreachable upstream holds it and requeues so the delete is
+			// retried rather than leaving stale upstream state.
+			result, done, err := r.withdrawUpstream(ctx, &policy, policy.Spec.TargetRef.Name, "during deletion")
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !done {
+				return result, nil
 			}
 			if err := r.releaseServiceFinalizer(ctx, &policy); err != nil {
 				return ctrl.Result{}, err
@@ -347,52 +358,220 @@ func (r *EdgePolicyReconciler) reconcileProtectedService(ctx context.Context,
 		}
 	}
 
-	// Record the discovered Service ports and load balancer IPs. Report them
-	// upstream before persisting the change so a failed report is retried on the
-	// next reconcile instead of being masked by an already-updated status.
+	// Record the discovered Service ports and load balancer IPs. When upstream
+	// reporting is configured, the report is submitted — and any queued job polled —
+	// asynchronously by syncUpstreamReport, which owns ObservedPorts and only advances
+	// it once a report is durably accepted. Otherwise we simply track the discovered
+	// state here and mark the policy protected.
 	desiredPorts := observedPortsFromService(service)
 	desiredIPs := loadBalancerIPs(service)
 	portsChanged := !observedPortsEqual(policy.Status.ObservedPorts, desiredPorts)
 	ipsChanged := !stringSlicesEqual(policy.Status.ObservedIPs, desiredIPs)
-	if portsChanged || ipsChanged || generationChanged {
-		if reportConfigured(policy) && upstreamConfigured {
-			key, err := r.reportPortsUpstream(ctx, policy, service, ipamSecret, desiredPorts, desiredIPs)
-			switch {
-			case errors.Is(err, errReportSuppressed):
-				// Identical to a report the upstream already rejected: keep the terminal
-				// Rejected status without re-sending, persisting ports, or requeuing. A
-				// changed report produces a different key and is attempted afresh.
-				return r.markReportRejected(ctx, policy, secretChanged || upstreamChanged)
-			case errors.Is(err, upstream.ErrUpstreamRejected):
-				// Remember the rejected payload so an identical retry is suppressed, and the
-				// upstream's detail so the terminal status explains why.
-				policy.Status.RejectedReportKey = key
-				policy.Status.RejectedReportMessage = upstreamRejectionDetail(err)
-				return r.handleReportFailure(ctx, policy, err, secretChanged || upstreamChanged)
-			case err != nil:
-				// Missing required fields (UpstreamReportIncomplete) or a transient
-				// delivery failure (UpstreamReportFailed). Both are soft: ObservedPorts is
-				// left unwritten so the retry re-sends once the cause clears.
-				return r.handleReportFailure(ctx, policy, err, secretChanged || upstreamChanged)
-			}
-			// Accepted: forget any prior rejection and clear the UpstreamReady condition
-			// so the status reads healthy again.
-			policy.Status.RejectedReportKey = ""
-			policy.Status.RejectedReportMessage = ""
-			if meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeUpstreamReady) {
-				upstreamChanged = true
-			}
-		}
+
+	if reportConfigured(policy) && upstreamConfigured {
+		return r.syncUpstreamReport(ctx, policy, service, ipamSecret, desiredPorts, desiredIPs,
+			portsChanged || ipsChanged || generationChanged, secretChanged || upstreamChanged)
+	}
+
+	if portsChanged || ipsChanged {
 		policy.Status.ObservedPorts = desiredPorts
 		policy.Status.ObservedIPs = desiredIPs
 	}
 
-	// The target Service is protected and its last report (if any) was accepted.
+	// The target Service is protected and no upstream report is required.
 	condChanged := setReadyCondition(policy, metav1.ConditionTrue, reasonServiceProtected,
 		fmt.Sprintf("Finalizer present on Service %q", service.Name))
 
 	return ctrl.Result{}, r.writeStatus(ctx, policy,
 		condChanged || secretChanged || upstreamChanged || portsChanged || ipsChanged)
+}
+
+// syncUpstreamReport advances the asynchronous upstream report state machine for a
+// protected Service whose policy declares a reportable block and whose upstream is
+// configured. In one reconcile it does exactly one of: poll an in-flight job, submit a
+// (fresh or changed) report, suppress an unchanged already-rejected report, or settle
+// as protected when there is nothing to do. Submitting and polling are single upstream
+// round-trips — a queued job is recorded on status.PendingReport and polled on later
+// reconciles rather than blocking a worker here, so a slow upstream never starves the
+// controller.
+//
+// desiredChanged reports whether the discovered ports/IPs or the spec generation
+// changed since the last accepted report; baseChanged carries status changes already
+// made by the caller (secret/upstream conditions) so they are persisted even when this
+// method would otherwise write nothing.
+func (r *EdgePolicyReconciler) syncUpstreamReport(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
+	service *corev1.Service, ipamSecret string, desiredPorts []securityv1alpha1.ObservedPort,
+	desiredIPs []string, desiredChanged, baseChanged bool) (ctrl.Result, error) {
+	pending := policy.Status.PendingReport
+
+	// Nothing in flight and nothing changed: the last accepted report still stands, so
+	// just reaffirm the policy as protected and settle at a quiet fixpoint.
+	if pending == nil && !desiredChanged {
+		return r.settleProtected(ctx, policy, service, baseChanged)
+	}
+
+	report, err := r.buildReport(ctx, policy, service, ipamSecret, desiredPorts, desiredIPs)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// The upstream requires the IPAM credential and at least one load balancer address
+	// on every report; without them the report is not sent.
+	if err := report.Validate(); err != nil {
+		policy.Status.PendingReport = nil
+		return r.handleReportFailure(ctx, policy, err, baseChanged)
+	}
+	key := report.IdempotencyKey()
+
+	// Once the upstream has rejected a report with a 4xx, an identical payload will be
+	// rejected again. Keep the terminal Rejected status without re-sending; a changed
+	// report produces a different key and is attempted afresh.
+	if policy.Status.RejectedReportKey == key {
+		policy.Status.PendingReport = nil
+		return r.markReportRejected(ctx, policy, baseChanged)
+	}
+
+	// Poll an in-flight job whose payload still matches what we would send; otherwise
+	// submit — covering both a changed desired state and a now-stale pending job.
+	if pending != nil && pending.Key == key {
+		return r.pollPendingReport(ctx, policy, service, pending, baseChanged)
+	}
+	return r.submitReport(ctx, policy, service, report, key, desiredPorts, desiredIPs, baseChanged)
+}
+
+// submitReport submits a report with a single upstream round-trip and records the
+// outcome: a synchronous acceptance settles the policy as protected; a queued job is
+// recorded on status.PendingReport and polled on the next reconcile; a rejection or
+// transient failure is surfaced via handleReportFailure with ObservedPorts left
+// unwritten so a retry re-sends once the cause clears.
+func (r *EdgePolicyReconciler) submitReport(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
+	service *corev1.Service, report upstream.PortReport, key string,
+	desiredPorts []securityv1alpha1.ObservedPort, desiredIPs []string, baseChanged bool) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	status, err := r.Reporter.ReportPorts(ctx, report)
+	switch {
+	case errors.Is(err, upstream.ErrUpstreamRejected):
+		// Remember the rejected payload so an identical retry is suppressed, and the
+		// upstream's detail so the terminal status explains why.
+		policy.Status.RejectedReportKey = key
+		policy.Status.RejectedReportMessage = upstreamRejectionDetail(err)
+		policy.Status.PendingReport = nil
+		return r.handleReportFailure(ctx, policy, err, baseChanged)
+	case err != nil:
+		// Transient delivery failure (DNS, connectivity, 5xx).
+		policy.Status.PendingReport = nil
+		return r.handleReportFailure(ctx, policy, err, baseChanged)
+	}
+
+	if status.Pending() {
+		// The upstream queued the report; record the job (with the ports/IPs it covers)
+		// and poll it on the next reconcile instead of blocking a worker here.
+		policy.Status.PendingReport = &securityv1alpha1.PendingReport{
+			Key:       key,
+			StatusURL: status.StatusURL,
+			JobID:     status.JobID,
+			Ports:     desiredPorts,
+			IPs:       desiredIPs,
+		}
+		log.Info("Queued upstream report job; polling for completion",
+			"edgepolicy", policy.Name, "jobId", status.JobID, "statusUrl", status.StatusURL)
+		return r.awaitPending(ctx, policy, baseChanged)
+	}
+
+	// Accepted synchronously.
+	if reportingDisabled(r.Reporter) {
+		log.Info("Skipped upstream report (reporting disabled)",
+			"edgepolicy", policy.Name, "service", service.Name, "ports", len(desiredPorts), "ips", len(desiredIPs))
+	} else {
+		log.Info("Reported discovered ports upstream",
+			"edgepolicy", policy.Name, "service", service.Name, "ports", len(desiredPorts), "ips", len(desiredIPs))
+	}
+	r.acceptReport(policy, desiredPorts, desiredIPs)
+	return r.settleProtected(ctx, policy, service, true)
+}
+
+// pollPendingReport performs a single poll of the in-flight job recorded on
+// status.PendingReport. A completed job is accepted (its captured ports become
+// ObservedPorts); a failed job is surfaced as a terminal rejection; a transient poll
+// failure or a still-running job requeues so polling resumes on the next reconcile,
+// without blocking a worker here.
+func (r *EdgePolicyReconciler) pollPendingReport(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
+	service *corev1.Service, pending *securityv1alpha1.PendingReport, baseChanged bool) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	status, err := r.Reporter.PollReport(ctx, pending.StatusURL)
+	switch {
+	case errors.Is(err, upstream.ErrUpstreamRejected):
+		// The job failed upstream; treat it as a terminal rejection and remember the
+		// payload so the identical retry is suppressed until the content changes.
+		policy.Status.RejectedReportKey = pending.Key
+		policy.Status.RejectedReportMessage = upstreamRejectionDetail(err)
+		policy.Status.PendingReport = nil
+		return r.handleReportFailure(ctx, policy, err, baseChanged)
+	case err != nil:
+		// Transient poll failure: keep the job and retry the poll on the next reconcile.
+		log.Info("Could not poll upstream report job; will retry",
+			"edgepolicy", policy.Name, "jobId", pending.JobID,
+			"retryAfter", r.pollInterval().String(), "error", err.Error())
+		return r.awaitPending(ctx, policy, baseChanged)
+	}
+
+	if status.Done {
+		log.Info("Upstream report job completed", "edgepolicy", policy.Name, "jobId", pending.JobID)
+		r.acceptReport(policy, pending.Ports, pending.IPs)
+		return r.settleProtected(ctx, policy, service, true)
+	}
+
+	// Still queued/running: poll again after the interval. Logged at V(1) so steady
+	// polling of a slow job does not spam the log.
+	log.V(1).Info("Upstream report job still pending; will poll again",
+		"edgepolicy", policy.Name, "jobId", pending.JobID, "retryAfter", r.pollInterval().String())
+	return r.awaitPending(ctx, policy, baseChanged)
+}
+
+// awaitPending marks UpstreamReady as pending for an in-flight report job, persists the
+// status when changed, and requeues after the poll interval so the job is polled again.
+// It deliberately leaves the Ready condition unchanged: a queued report is in progress,
+// not failed, so Ready keeps reflecting the last settled state rather than flapping on
+// every report.
+func (r *EdgePolicyReconciler) awaitPending(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
+	baseChanged bool) (ctrl.Result, error) {
+	changed := setUpstreamPendingCondition(policy)
+	if err := r.writeStatus(ctx, policy, changed || baseChanged); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: r.pollInterval()}, nil
+}
+
+// acceptReport records a durably accepted report: it advances ObservedPorts/IPs to the
+// accepted set, forgets any remembered rejection, clears the in-flight job, and drops
+// the UpstreamReady condition so the status reads healthy. settleProtected then marks
+// the policy Ready and persists the status.
+func (r *EdgePolicyReconciler) acceptReport(policy *securityv1alpha1.EdgePolicy,
+	ports []securityv1alpha1.ObservedPort, ips []string) {
+	policy.Status.ObservedPorts = ports
+	policy.Status.ObservedIPs = ips
+	policy.Status.PendingReport = nil
+	policy.Status.RejectedReportKey = ""
+	policy.Status.RejectedReportMessage = ""
+	meta.RemoveStatusCondition(&policy.Status.Conditions, conditionTypeUpstreamReady)
+}
+
+// settleProtected marks the policy's target Service as protected (Ready=True) and
+// persists the status when anything changed. changed carries whether an upstream
+// outcome or an earlier condition write already dirtied the status.
+func (r *EdgePolicyReconciler) settleProtected(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
+	service *corev1.Service, changed bool) (ctrl.Result, error) {
+	condChanged := setReadyCondition(policy, metav1.ConditionTrue, reasonServiceProtected,
+		fmt.Sprintf("Finalizer present on Service %q", service.Name))
+	return ctrl.Result{}, r.writeStatus(ctx, policy, condChanged || changed)
+}
+
+// pollInterval is how long to wait before polling an in-flight upstream report job
+// again, from the UpstreamPollInterval field when set or the package default otherwise.
+func (r *EdgePolicyReconciler) pollInterval() time.Duration {
+	if r.UpstreamPollInterval > 0 {
+		return r.UpstreamPollInterval
+	}
+	return defaultUpstreamPollInterval
 }
 
 // setReadyCondition mutates the Ready condition and ObservedGeneration on the policy
@@ -505,21 +684,17 @@ func additionalPorts(policy *securityv1alpha1.EdgePolicy) []upstream.Port {
 	return ports
 }
 
-// reportPortsUpstream sends the discovered ports to the external system via the
-// configured Reporter. It is a no-op when no Reporter is configured. The caller
-// supplies the already-resolved ipamSecret so secret resolution and its status
-// condition are handled in one place. It returns the report's idempotency key so the
-// caller can remember a rejected payload; when that key matches a previously rejected
-// report the call is short-circuited with errReportSuppressed instead of re-sending.
-func (r *EdgePolicyReconciler) reportPortsUpstream(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
-	service *corev1.Service, ipamSecret string, ports []securityv1alpha1.ObservedPort, ips []string) (string, error) {
-	if r.Reporter == nil {
-		return "", nil
-	}
-
+// buildReport assembles the upstream PortReport for a policy's current discovered
+// ports and load balancer IPs, resolving the cluster and namespace identifiers. The
+// caller (syncUpstreamReport) validates, submits, or polls the report; this function
+// only constructs it. The caller supplies the already-resolved ipamSecret so secret
+// resolution and its status condition are handled in one place.
+func (r *EdgePolicyReconciler) buildReport(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
+	service *corev1.Service, ipamSecret string, ports []securityv1alpha1.ObservedPort,
+	ips []string) (upstream.PortReport, error) {
 	clusterID, err := r.clusterUID(ctx)
 	if err != nil {
-		return "", fmt.Errorf("resolving cluster ID: %w", err)
+		return upstream.PortReport{}, fmt.Errorf("resolving cluster ID: %w", err)
 	}
 
 	ipv4, ipv6 := splitIPFamilies(ips)
@@ -531,7 +706,7 @@ func (r *EdgePolicyReconciler) reportPortsUpstream(ctx context.Context, policy *
 			Protocol: string(p.Protocol),
 		})
 	}
-	report := upstream.PortReport{
+	return upstream.PortReport{
 		ClusterID:             clusterID,
 		EdgePolicyNamespaceID: r.namespaceUID(ctx, policy.Namespace),
 		EdgePolicyID:          string(policy.UID),
@@ -547,67 +722,30 @@ func (r *EdgePolicyReconciler) reportPortsUpstream(ctx context.Context, policy *
 			AdditionalPorts: additionalPorts(policy),
 		},
 		DDoS: ddosReport(policy),
-	}
-	// The upstream requires the IPAM credential and at least one load balancer
-	// address on every report; without them the report is not sent.
-	if err := report.Validate(); err != nil {
-		return "", err
-	}
-	// Once the upstream has rejected a report with a 4xx, an identical payload will be
-	// rejected again. Short-circuit it so the policy settles on its terminal Rejected
-	// status instead of re-POSTing on every reconcile and Service event.
-	key := report.IdempotencyKey()
-	if policy.Status.RejectedReportKey != "" && policy.Status.RejectedReportKey == key {
-		return key, errReportSuppressed
-	}
-	if err := r.Reporter.ReportPorts(ctx, report); err != nil {
-		return key, err
-	}
-	log := logf.FromContext(ctx)
-	if reportingDisabled(r.Reporter) {
-		log.Info("Skipped upstream report (reporting disabled)",
-			"edgepolicy", policy.Name, "service", service.Name, "ports", len(ports), "ips", len(ips))
-	} else {
-		log.Info("Reported discovered ports upstream",
-			"edgepolicy", policy.Name, "service", service.Name, "ports", len(ports), "ips", len(ips))
-	}
-	return key, nil
+	}, nil
 }
 
 // deactivatePolicy releases the operator's hold on a Service that is no longer
 // managed (it is terminating or is no longer a LoadBalancer): it withdraws any
 // previously reported ports upstream, removes the Service finalizer, and marks the
-// policy inactive with the given reason/message. A transient upstream withdraw
-// failure requeues after upstreamRetryInterval and keeps the finalizer so the
-// delete is retried rather than leaving stale upstream state. note labels the log
-// lines with the triggering transition.
+// policy inactive with the given reason/message. The withdrawal is non-blocking: a
+// queued job keeps the Service finalizer and requeues (polling until it completes), as
+// does a transient/terminal failure, so the delete is retried rather than leaving stale
+// upstream state. note labels the log lines with the triggering transition.
 func (r *EdgePolicyReconciler) deactivatePolicy(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
 	service *corev1.Service, reason, message, note string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	hadState := len(policy.Status.ObservedPorts) > 0 || len(policy.Status.ObservedIPs) > 0
+	// Withdraw whatever may be live upstream: an accepted report and/or one still in
+	// flight. hasWithdrawalTarget covers both so a policy deactivated mid-report still
+	// withdraws the queued payload.
+	hadState := hasWithdrawalTarget(policy)
 	if hadState {
-		if err := r.deletePortsUpstream(ctx, policy, service.Name); err != nil {
-			switch {
-			case errors.Is(err, upstream.ErrUpstreamNotFound):
-				// 404: the upstream has no record of the report — already withdrawn/gone.
-				// Treat as success and release the Service finalizer.
-				log.Info("Upstream had no record of the report; treating as already withdrawn",
-					"service", service.Name, "transition", note, "detail", err.Error())
-			case errors.Is(err, upstream.ErrIncompleteReport):
-				// Nothing valid to withdraw (missing credential or addresses): no request
-				// is sent, so there is no upstream state to confirm. Release the finalizer
-				// rather than holding it on a precondition that will not be met.
-				log.Info("Skipped upstream withdrawal; required fields missing",
-					"service", service.Name, "transition", note, "detail", err.Error())
-			default:
-				// Upstream refused (non-404 4xx) or could not be reached (5xx/transport):
-				// only a 2xx confirms the withdrawal, so hold the Service finalizer and
-				// retry rather than releasing it and leaving stale upstream state.
-				log.Info("Could not withdraw ports upstream; will retry",
-					"service", service.Name, "transition", note,
-					"retryAfter", upstreamRetryInterval.String(), "error", err.Error())
-				return ctrl.Result{RequeueAfter: upstreamRetryInterval}, nil
-			}
+		result, done, err := r.withdrawUpstream(ctx, policy, service.Name, note)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !done {
+			return result, nil
 		}
 	}
 	if controllerutil.RemoveFinalizer(service, serviceFinalizer) {
@@ -626,37 +764,233 @@ func (r *EdgePolicyReconciler) deactivatePolicy(ctx context.Context, policy *sec
 	return ctrl.Result{}, r.writeStatus(ctx, policy, changed)
 }
 
-// deletePortsUpstream withdraws a policy's previously reported ports from the
-// upstream system when the policy or its target Service is removed. The report is
-// reconstructed from the policy status (last observed ports and IPs) plus the
-// datacenter and declared additional ports from the spec. The upstream requires the
-// IPAM credential on the withdrawal too, so it is resolved best-effort from the
-// target Service's ipam.vitistack.io/secret annotation; when the Service is already
-// gone the credential (and zone) are simply omitted. It is a no-op unless the policy
-// declares a filter or ddos block and the Reporter is configured.
-func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
-	policy *securityv1alpha1.EdgePolicy, serviceName string) error {
+// withdrawUpstream advances the asynchronous upstream withdrawal for a policy whose
+// object or target Service is going away. In one reconcile it polls an in-flight
+// withdrawal job, submits the next withdrawal, or reports there is nothing left to
+// withdraw — each a single upstream round-trip. A queued job is recorded on
+// status.PendingWithdrawal and polled on later reconciles rather than blocking a worker.
+//
+// There may be two distinct payloads live upstream at deletion time: the last accepted
+// report (ObservedPorts) and a newer report that was still in flight (PendingReport).
+// They are withdrawn one at a time — each withdrawn payload is cleared from the status
+// as it completes (see advanceWithdrawal), so the next reconcile picks up the remaining
+// one — until none remain.
+//
+// It returns done=true when the upstream holds no (further) record of any report, so the
+// caller may release its finalizer. It returns done=false with a Result when a
+// withdrawal is not yet complete (a job is in flight, another payload remains, or a
+// transient/terminal failure is being retried); the caller must return that Result and
+// keep its finalizer so the delete is retried rather than leaving stale upstream state.
+// A non-nil error is a hard failure (e.g. a status write) the caller surfaces.
+//
+// label identifies the triggering transition in log lines (e.g. "during deletion").
+func (r *EdgePolicyReconciler) withdrawUpstream(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
+	serviceName, label string) (ctrl.Result, bool, error) {
 	if !reportConfigured(policy) || !reporterConfigured(r.Reporter) || r.Reporter == nil {
-		return nil
+		return ctrl.Result{}, true, nil
+	}
+	log := logf.FromContext(ctx)
+
+	// Poll an in-flight withdrawal job (for the current head payload) instead of
+	// re-submitting.
+	if pending := policy.Status.PendingWithdrawal; pending != nil {
+		status, err := r.Reporter.PollReport(ctx, pending.StatusURL)
+		switch {
+		case errors.Is(err, upstream.ErrUpstreamNotFound):
+			log.Info("Upstream had no record of the report; treating as already withdrawn",
+				"edgepolicy", policy.Name, "transition", label, "detail", err.Error())
+			return r.advanceWithdrawal(ctx, policy, label)
+		case errors.Is(err, upstream.ErrUpstreamRejected):
+			log.Info("Upstream refused the withdrawal; will retry",
+				"edgepolicy", policy.Name, "transition", label,
+				"retryAfter", upstreamRetryInterval.String(), "error", err.Error())
+			return ctrl.Result{RequeueAfter: upstreamRetryInterval}, false, nil
+		case err != nil:
+			log.Info("Could not poll upstream withdrawal job; will retry",
+				"edgepolicy", policy.Name, "transition", label,
+				"retryAfter", r.pollInterval().String(), "error", err.Error())
+			return ctrl.Result{RequeueAfter: r.pollInterval()}, false, nil
+		}
+		if status.Done {
+			log.Info("Upstream withdrawal job completed",
+				"edgepolicy", policy.Name, "transition", label, "jobId", pending.JobID)
+			return r.advanceWithdrawal(ctx, policy, label)
+		}
+		// Still in flight: keep the finalizer and poll again.
+		log.V(1).Info("Upstream withdrawal job still pending; will poll again",
+			"edgepolicy", policy.Name, "transition", label, "jobId", pending.JobID)
+		return ctrl.Result{RequeueAfter: r.pollInterval()}, false, nil
 	}
 
+	// No job in flight: submit the next pending withdrawal payload.
+	report, ok, err := r.nextWithdrawalReport(ctx, policy, serviceName)
+	if err != nil {
+		// A transient failure building the report (e.g. the cluster ID lookup); retry.
+		log.Info("Could not withdraw ports upstream; will retry",
+			"edgepolicy", policy.Name, "transition", label,
+			"retryAfter", upstreamRetryInterval.String(), "error", err.Error())
+		return ctrl.Result{RequeueAfter: upstreamRetryInterval}, false, nil
+	}
+	if !ok {
+		// Nothing (left) to withdraw.
+		return ctrl.Result{}, true, nil
+	}
+	// The upstream requires the IPAM credential and at least one load balancer address
+	// on a withdrawal too; without them there is nothing it can act on, so the DELETE is
+	// not sent and deletion proceeds rather than wedging on an unmeetable precondition
+	// (e.g. the target Service is already gone, so the credential cannot be resolved —
+	// which affects every remaining payload equally).
+	if err := report.Validate(); err != nil {
+		log.Info("Skipped upstream withdrawal; required fields missing",
+			"edgepolicy", policy.Name, "transition", label, "detail", err.Error())
+		return ctrl.Result{}, true, nil
+	}
+
+	status, err := r.Reporter.DeletePorts(ctx, report)
+	switch {
+	case errors.Is(err, upstream.ErrUpstreamNotFound):
+		// 404: the upstream has no record of this payload — already withdrawn/gone.
+		log.Info("Upstream had no record of the report; treating as already withdrawn",
+			"edgepolicy", policy.Name, "transition", label, "detail", err.Error())
+		return r.advanceWithdrawal(ctx, policy, label)
+	case errors.Is(err, upstream.ErrUpstreamRejected):
+		// Upstream refused the withdrawal (non-404 4xx): hold the finalizer and retry.
+		log.Info("Upstream refused the withdrawal; will retry",
+			"edgepolicy", policy.Name, "transition", label,
+			"retryAfter", upstreamRetryInterval.String(), "error", err.Error())
+		return ctrl.Result{RequeueAfter: upstreamRetryInterval}, false, nil
+	case err != nil:
+		// Could not be reached (5xx/transport): hold the finalizer and retry.
+		log.Info("Could not withdraw ports upstream; will retry",
+			"edgepolicy", policy.Name, "transition", label,
+			"retryAfter", upstreamRetryInterval.String(), "error", err.Error())
+		return ctrl.Result{RequeueAfter: upstreamRetryInterval}, false, nil
+	}
+
+	if status.Pending() {
+		// The upstream queued the withdrawal; record the job and poll it on the next
+		// reconcile, holding the finalizer until it completes.
+		policy.Status.PendingWithdrawal = &securityv1alpha1.PendingReport{
+			Key:       report.IdempotencyKey(),
+			StatusURL: status.StatusURL,
+			JobID:     status.JobID,
+		}
+		log.Info("Queued upstream withdrawal job; polling for completion",
+			"edgepolicy", policy.Name, "transition", label, "jobId", status.JobID, "statusUrl", status.StatusURL)
+		if err := r.writeStatus(ctx, policy, true); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{RequeueAfter: r.pollInterval()}, false, nil
+	}
+
+	log.Info("Withdrew ports upstream",
+		"edgepolicy", policy.Name, "service", serviceName, "transition", label)
+	return r.advanceWithdrawal(ctx, policy, label)
+}
+
+// nextWithdrawalReport builds the withdrawal payload for the current head — the last
+// accepted report (ObservedPorts) if present, otherwise an in-flight report
+// (PendingReport). It returns ok=false when nothing remains to withdraw.
+func (r *EdgePolicyReconciler) nextWithdrawalReport(ctx context.Context,
+	policy *securityv1alpha1.EdgePolicy, serviceName string) (upstream.PortReport, bool, error) {
+	if !hasWithdrawalTarget(policy) {
+		return upstream.PortReport{}, false, nil
+	}
+	report, err := r.buildWithdrawalReport(ctx, policy, serviceName)
+	if err != nil {
+		return upstream.PortReport{}, false, err
+	}
+	return report, true, nil
+}
+
+// advanceWithdrawal records that the current head payload was withdrawn: it clears that
+// payload (and any in-flight report identical to it) and the in-flight withdrawal job,
+// then reports whether another distinct payload still needs withdrawing. When one does,
+// it persists the progress and requeues (done=false) so the next reconcile withdraws it
+// instead of re-withdrawing the one just handled; otherwise it reports done=true so the
+// caller releases its finalizer.
+func (r *EdgePolicyReconciler) advanceWithdrawal(ctx context.Context,
+	policy *securityv1alpha1.EdgePolicy, label string) (ctrl.Result, bool, error) {
+	policy.Status.PendingWithdrawal = nil
+	clearWithdrawnHead(policy)
+	if !hasWithdrawalTarget(policy) {
+		return ctrl.Result{}, true, nil
+	}
+	// A newer, distinct in-flight report remains. Persist the progress so the next
+	// reconcile withdraws it rather than re-withdrawing the payload just handled.
+	logf.FromContext(ctx).V(1).Info("Withdrew one report payload; a newer in-flight report remains",
+		"edgepolicy", policy.Name, "transition", label)
+	if err := r.writeStatus(ctx, policy, true); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	return ctrl.Result{RequeueAfter: r.pollInterval()}, false, nil
+}
+
+// hasWithdrawalTarget reports whether the policy still has a report payload that may be
+// live upstream and needs withdrawing: an accepted report (ObservedPorts/IPs) or one
+// still in flight (PendingReport).
+func hasWithdrawalTarget(policy *securityv1alpha1.EdgePolicy) bool {
+	return len(policy.Status.ObservedPorts) > 0 || len(policy.Status.ObservedIPs) > 0 ||
+		policy.Status.PendingReport != nil
+}
+
+// clearWithdrawnHead clears the payload that nextWithdrawalReport just returned — the
+// accepted report when one is present (buildWithdrawalReport prefers it), otherwise the
+// in-flight report. When the accepted payload is cleared, an identical in-flight report
+// is cleared too, since the same content shares the upstream record just withdrawn.
+func clearWithdrawnHead(policy *securityv1alpha1.EdgePolicy) {
+	if len(policy.Status.ObservedPorts) > 0 || len(policy.Status.ObservedIPs) > 0 {
+		obsPorts, obsIPs := policy.Status.ObservedPorts, policy.Status.ObservedIPs
+		policy.Status.ObservedPorts = nil
+		policy.Status.ObservedIPs = nil
+		if pr := policy.Status.PendingReport; pr != nil &&
+			observedPortsEqual(pr.Ports, obsPorts) && stringSlicesEqual(pr.IPs, obsIPs) {
+			policy.Status.PendingReport = nil
+		}
+		return
+	}
+	policy.Status.PendingReport = nil
+}
+
+// buildWithdrawalReport reconstructs the withdrawal payload from the policy's last
+// observed ports and IPs plus the datacenter and declared additional ports from the
+// spec. The upstream requires the IPAM credential on the withdrawal too, so it is
+// resolved best-effort from the target Service's ipam.vitistack.io/secret annotation;
+// when the Service is already gone the credential (and zone) are simply omitted.
+//
+// When no report has been accepted yet (ObservedPorts/IPs are empty) but one is still
+// in flight — e.g. the policy was deleted while its first report was queued upstream —
+// the payload is taken from status.PendingReport instead, so the withdrawal carries the
+// same ports/IPs (and therefore the same Idempotency-Key) as the queued report and the
+// upstream can cancel it rather than orphaning the programmed state. A newer in-flight
+// report over an already-accepted one is not separately withdrawn: the accepted state
+// is the primary concern and is what gets withdrawn here.
+func (r *EdgePolicyReconciler) buildWithdrawalReport(ctx context.Context,
+	policy *securityv1alpha1.EdgePolicy, serviceName string) (upstream.PortReport, error) {
 	clusterID, err := r.clusterUID(ctx)
 	if err != nil {
-		return fmt.Errorf("resolving cluster ID: %w", err)
+		return upstream.PortReport{}, fmt.Errorf("resolving cluster ID: %w", err)
 	}
 
 	ipamSecret, ipamZone := r.ipamCredentialForDelete(ctx, policy.Namespace, serviceName)
 
-	ipv4, ipv6 := splitIPFamilies(policy.Status.ObservedIPs)
-	observed := make([]upstream.Port, 0, len(policy.Status.ObservedPorts))
-	for _, p := range policy.Status.ObservedPorts {
+	ports := policy.Status.ObservedPorts
+	ips := policy.Status.ObservedIPs
+	if len(ports) == 0 && len(ips) == 0 && policy.Status.PendingReport != nil {
+		ports = policy.Status.PendingReport.Ports
+		ips = policy.Status.PendingReport.IPs
+	}
+
+	ipv4, ipv6 := splitIPFamilies(ips)
+	observed := make([]upstream.Port, 0, len(ports))
+	for _, p := range ports {
 		observed = append(observed, upstream.Port{
 			Name:     p.Name,
 			Port:     p.Port,
 			Protocol: string(p.Protocol),
 		})
 	}
-	report := upstream.PortReport{
+	return upstream.PortReport{
 		ClusterID:             clusterID,
 		EdgePolicyNamespaceID: r.namespaceUID(ctx, policy.Namespace),
 		EdgePolicyID:          string(policy.UID),
@@ -672,19 +1006,7 @@ func (r *EdgePolicyReconciler) deletePortsUpstream(ctx context.Context,
 			AdditionalPorts: additionalPorts(policy),
 		},
 		DDoS: ddosReport(policy),
-	}
-	// The upstream requires the IPAM credential and at least one load balancer
-	// address on a withdrawal too; without them there is nothing it can act on, so
-	// the DELETE is not sent.
-	if err := report.Validate(); err != nil {
-		return err
-	}
-	if err := r.Reporter.DeletePorts(ctx, report); err != nil {
-		return err
-	}
-	logf.FromContext(ctx).Info("Withdrew ports upstream",
-		"edgepolicy", policy.Name, "service", serviceName)
-	return nil
+	}, nil
 }
 
 // ipamCredentialForDelete resolves the IPAM credential and zone for a withdrawal
@@ -858,6 +1180,20 @@ func setUpstreamConfiguredCondition(policy *securityv1alpha1.EdgePolicy, configu
 		Status:             metav1.ConditionFalse,
 		Reason:             reasonUpstreamNotConfigured,
 		Message:            "No upstream API URL configured (set UPSTREAM_API_URL)",
+		ObservedGeneration: policy.Generation,
+	})
+}
+
+// setUpstreamPendingCondition marks UpstreamReady as False/UpstreamReportPending while
+// a queued report job is being polled to completion, so the in-flight state is visible
+// on the status. It returns whether the status changed. A later successful poll clears
+// the condition via acceptReport; a failed poll replaces it with a failure reason.
+func setUpstreamPendingCondition(policy *securityv1alpha1.EdgePolicy) bool {
+	return meta.SetStatusCondition(&policy.Status.Conditions, metav1.Condition{
+		Type:               conditionTypeUpstreamReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonUpstreamPending,
+		Message:            "Upstream report queued; awaiting completion",
 		ObservedGeneration: policy.Generation,
 	})
 }

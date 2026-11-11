@@ -180,11 +180,67 @@ type EdgePolicyStatus struct {
 	// +kubebuilder:validation:MaxLength=512
 	RejectedReportMessage string `json:"rejectedReportMessage,omitempty"`
 
+	// PendingReport tracks an upstream report that was accepted for asynchronous
+	// processing (the status-queue flow) and whose outcome is still being polled. It is
+	// nil when no report is in flight. While set, the controller polls the job's status
+	// URL once per reconcile (instead of blocking or re-submitting) and requeues until
+	// the job reaches a terminal state, so a reconcile worker is never held waiting on
+	// the upstream.
+	// +optional
+	PendingReport *PendingReport `json:"pendingReport,omitempty"`
+
+	// PendingWithdrawal tracks an upstream withdrawal (DELETE) that was accepted for
+	// asynchronous processing and whose outcome is still being polled. It is nil when no
+	// withdrawal is in flight. While set, the controller holds the relevant finalizer
+	// and polls the job's status URL once per reconcile until it completes, so deletion
+	// never blocks a worker and the finalizer is released only once the upstream has
+	// durably withdrawn the report.
+	// +optional
+	PendingWithdrawal *PendingReport `json:"pendingWithdrawal,omitempty"`
+
 	// Conditions represent the current status of the edge policy.
 	// +optional
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// PendingReport records an upstream report job that was queued for asynchronous
+// processing and is still being polled for completion.
+type PendingReport struct {
+	// Key is the idempotency key of the submitted report. When the desired report's
+	// key no longer matches (the policy or its target Service changed while the job was
+	// in flight), the pending job is stale and a fresh report is submitted instead of
+	// polling it.
+	// +required
+	// +kubebuilder:validation:MaxLength=64
+	Key string `json:"key"`
+
+	// StatusURL is the upstream URL polled for the queued job's outcome.
+	// +required
+	// +kubebuilder:validation:MaxLength=2048
+	StatusURL string `json:"statusUrl"`
+
+	// JobID identifies the queued job upstream, for logging and correlation.
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	JobID string `json:"jobId,omitempty"`
+
+	// Ports is the set of discovered ports captured when the report was submitted.
+	// It is recorded as ObservedPorts once the job completes successfully, so
+	// ObservedPorts only ever reflects a report the upstream durably accepted.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=256
+	Ports []ObservedPort `json:"ports,omitempty"`
+
+	// IPs is the set of load balancer ingress addresses captured when the report was
+	// submitted, recorded as ObservedIPs once the job completes successfully.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MaxLength=45
+	IPs []string `json:"ips,omitempty"`
 }
 
 // +kubebuilder:object:root=true

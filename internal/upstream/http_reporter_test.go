@@ -28,11 +28,17 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 // testServiceName is the placeholder Service name used across reporter tests.
 const testServiceName = "svc"
+
+// Queued-job state strings reused across the status-queue tests (goconst).
+const (
+	statePending   = "pending"
+	stateCompleted = "completed"
+	stateFailed    = "failed"
+)
 
 // TestHTTPReporterAlwaysSendsAddressArrays verifies the serialized report always
 // carries ipv4Addresses and ipv6Addresses as arrays (as [] when the Service has no
@@ -47,7 +53,7 @@ func TestHTTPReporterAlwaysSendsAddressArrays(t *testing.T) {
 	defer server.Close()
 
 	reporter := NewHTTPReporter(server.URL, false)
-	if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+	if _, err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
 		t.Fatalf("ReportPorts: %v", err)
 	}
 	if !strings.Contains(got, `"ipv4Addresses":[]`) {
@@ -81,7 +87,7 @@ func TestHTTPReporterErrorIncludesBody(t *testing.T) {
 			defer server.Close()
 
 			reporter := NewHTTPReporter(server.URL, false)
-			err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
+			_, err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
 			if err == nil {
 				t.Fatalf("expected an error for status %d", tc.status)
 			}
@@ -121,7 +127,7 @@ func TestHTTPReporterStatusHandling(t *testing.T) {
 			defer server.Close()
 
 			reporter := NewHTTPReporter(server.URL, false)
-			err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
+			_, err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
 
 			if tc.wantErr && err == nil {
 				t.Fatalf("expected an error for status %d, got nil", tc.status)
@@ -146,7 +152,7 @@ func TestHTTPReporterDeleteRejection(t *testing.T) {
 	defer server.Close()
 
 	reporter := NewHTTPReporter(server.URL, false)
-	err := reporter.DeletePorts(context.Background(), PortReport{ServiceName: testServiceName})
+	_, err := reporter.DeletePorts(context.Background(), PortReport{ServiceName: testServiceName})
 	if !errors.Is(err, ErrUpstreamRejected) {
 		t.Fatalf("expected ErrUpstreamRejected for a 422 DELETE, got %v", err)
 	}
@@ -162,7 +168,7 @@ func TestHTTPReporterNotFound(t *testing.T) {
 	defer server.Close()
 
 	reporter := NewHTTPReporter(server.URL, false)
-	err := reporter.DeletePorts(context.Background(), PortReport{ServiceName: testServiceName})
+	_, err := reporter.DeletePorts(context.Background(), PortReport{ServiceName: testServiceName})
 	if !errors.Is(err, ErrUpstreamNotFound) {
 		t.Fatalf("expected ErrUpstreamNotFound for a 404, got %v", err)
 	}
@@ -197,14 +203,14 @@ func TestHTTPReporterCABundle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewHTTPReporterWithCA: %v", err)
 		}
-		if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+		if _, err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
 			t.Fatalf("expected report to succeed with trusted CA, got %v", err)
 		}
 	})
 
 	t.Run("fails without CA", func(t *testing.T) {
 		reporter := NewHTTPReporter(server.URL, false)
-		if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err == nil {
+		if _, err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err == nil {
 			t.Fatal("expected a TLS verification error without the CA, got nil")
 		}
 	})
@@ -214,7 +220,7 @@ func TestHTTPReporterCABundle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewHTTPReporterWithCA: %v", err)
 		}
-		if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+		if _, err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
 			t.Fatalf("expected report to succeed with insecureSkipVerify, got %v", err)
 		}
 	})
@@ -244,7 +250,7 @@ func TestHTTPReporterCABundle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewHTTPReporterWithCA: %v", err)
 		}
-		if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+		if _, err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
 			t.Fatalf("expected report to succeed with CA from directory, got %v", err)
 		}
 	})
@@ -272,17 +278,16 @@ func TestHTTPReporterCABundleErrors(t *testing.T) {
 }
 
 // statusQueueReporter builds a reporter pointed at server with the status queue
-// enabled and a fast polling cadence so tests do not wait on real timers.
+// enabled. Submissions and polls are single round-trips, so no polling-cadence tuning
+// is needed; the controller owns the poll interval.
 func statusQueueReporter(serverURL string) *HTTPReporter {
 	r := NewHTTPReporter(serverURL, false)
 	r.ReportingStatusQueue = true
-	r.StatusPollInterval = time.Millisecond
-	r.StatusPollTimeout = 2 * time.Second
 	return r
 }
 
 // TestStatusQueueDisabledIgnoresBody confirms that with the status queue off, a 2xx
-// submission is final and the (status-URL-bearing) response body is ignored.
+// submission is final (Done) and the (status-URL-bearing) response body is ignored.
 func TestStatusQueueDisabledIgnoresBody(t *testing.T) {
 	var polled bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -295,8 +300,12 @@ func TestStatusQueueDisabledIgnoresBody(t *testing.T) {
 	defer server.Close()
 
 	reporter := NewHTTPReporter(server.URL, false) // status queue disabled
-	if err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+	status, err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
+	if err != nil {
 		t.Fatalf("ReportPorts: %v", err)
+	}
+	if !status.Done {
+		t.Fatalf("expected Done with the status queue disabled, got %+v", status)
 	}
 	if polled {
 		t.Fatal("status queue disabled, but the reporter polled a status URL")
@@ -304,7 +313,7 @@ func TestStatusQueueDisabledIgnoresBody(t *testing.T) {
 }
 
 // TestStatusQueueSyncCompletion confirms that when the status queue is enabled but the
-// submission returns no status URL, the 2xx is treated as immediate success.
+// submission returns no status URL, the 2xx is treated as immediate success (Done).
 func TestStatusQueueSyncCompletion(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -312,72 +321,25 @@ func TestStatusQueueSyncCompletion(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := statusQueueReporter(server.URL).
-		ReportPorts(context.Background(), PortReport{ServiceName: testServiceName}); err != nil {
+	status, err := statusQueueReporter(server.URL).
+		ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
+	if err != nil {
 		t.Fatalf("ReportPorts: %v", err)
 	}
-}
-
-// TestStatusQueuePollsToTerminalState drives the poll loop through a pending state to
-// each terminal outcome: success is nil, a failed job is the terminal ErrUpstreamRejected.
-func TestStatusQueuePollsToTerminalState(t *testing.T) {
-	cases := map[string]struct {
-		finalState   string
-		wantErr      bool
-		wantRejected bool
-	}{
-		"completed": {finalState: "completed", wantErr: false},
-		"succeeded": {finalState: "SUCCEEDED", wantErr: false},
-		"failed":    {finalState: "failed", wantErr: true, wantRejected: true},
-		"error":     {finalState: "error", wantErr: true, wantRejected: true},
-	}
-
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			var polls int
-			mux := http.NewServeMux()
-			mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
-				polls++
-				state := "pending"
-				if polls >= 2 { // stay pending once, then settle
-					state = tc.finalState
-				}
-				_, _ = w.Write([]byte(`{"status":"` + state + `","message":"m"}`))
-			})
-			var server *httptest.Server
-			mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(http.StatusAccepted)
-				_, _ = w.Write([]byte(`{"statusUrl":"` + server.URL + `/status","jobId":"j1"}`))
-			})
-			server = httptest.NewServer(mux)
-			defer server.Close()
-
-			err := statusQueueReporter(server.URL).
-				ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
-			if tc.wantErr && err == nil {
-				t.Fatalf("expected an error for final state %q, got nil", tc.finalState)
-			}
-			if !tc.wantErr && err != nil {
-				t.Fatalf("expected no error for final state %q, got %v", tc.finalState, err)
-			}
-			if got := errors.Is(err, ErrUpstreamRejected); got != tc.wantRejected {
-				t.Fatalf("state %q: errors.Is(err, ErrUpstreamRejected) = %v, want %v (err=%v)",
-					tc.finalState, got, tc.wantRejected, err)
-			}
-			if polls < 2 {
-				t.Fatalf("expected the reporter to poll past the pending state, got %d poll(s)", polls)
-			}
-		})
+	if !status.Done {
+		t.Fatalf("expected Done when the upstream completes synchronously, got %+v", status)
 	}
 }
 
-// TestStatusQueueTimeout confirms that a job stuck in a non-terminal state past the
-// poll budget yields a transient error (not ErrUpstreamRejected) so the controller
-// requeues and the next attempt resumes the same job.
-func TestStatusQueueTimeout(t *testing.T) {
+// TestReportPortsQueuedDoesNotBlock confirms that with the status queue enabled, a 2xx
+// carrying a status URL returns a Pending ReportStatus without polling — the controller
+// drives polling via PollReport on later reconciles, so a worker is never held here.
+func TestReportPortsQueuedDoesNotBlock(t *testing.T) {
+	var polled bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"status":"running"}`))
+		polled = true
+		_, _ = w.Write([]byte(`{"status":"pending"}`))
 	})
 	var server *httptest.Server
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
@@ -387,49 +349,127 @@ func TestStatusQueueTimeout(t *testing.T) {
 	server = httptest.NewServer(mux)
 	defer server.Close()
 
-	reporter := statusQueueReporter(server.URL)
-	reporter.StatusPollTimeout = 50 * time.Millisecond
-	err := reporter.ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
-	if err == nil {
-		t.Fatal("expected a timeout error for a job that never settles, got nil")
+	status, err := statusQueueReporter(server.URL).
+		ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
+	if err != nil {
+		t.Fatalf("ReportPorts: %v", err)
 	}
-	if errors.Is(err, ErrUpstreamRejected) {
-		t.Fatalf("a poll timeout should be transient, not a terminal rejection: %v", err)
+	if !status.Pending() {
+		t.Fatalf("expected a pending ReportStatus for a queued report, got %+v", status)
+	}
+	if status.StatusURL != server.URL+"/status" || status.JobID != "j1" {
+		t.Fatalf("expected the queued job's status URL and ID, got %+v", status)
+	}
+	if polled {
+		t.Fatal("ReportPorts polled the status URL; polling must be driven by PollReport")
 	}
 }
 
-// TestStatusQueuePollError confirms a 4xx from the status URL is a terminal rejection
-// while a 5xx is transient, mirroring submission classification.
-func TestStatusQueuePollError(t *testing.T) {
+// TestPollReportDrivesToTerminalState drives PollReport through each outcome: a pending
+// job stays Pending, a succeeded job is Done, a failed job is the terminal
+// ErrUpstreamRejected, a 4xx status URL is terminal, and a 5xx is a plain transient error.
+func TestPollReportDrivesToTerminalState(t *testing.T) {
 	cases := map[string]struct {
-		status       int
+		state        string
+		httpStatus   int
+		wantDone     bool
+		wantPending  bool
+		wantErr      bool
 		wantRejected bool
 	}{
-		"status URL 400": {status: http.StatusBadRequest, wantRejected: true},
-		"status URL 500": {status: http.StatusInternalServerError, wantRejected: false},
+		"pending":    {state: statePending, httpStatus: http.StatusOK, wantPending: true},
+		"completed":  {state: stateCompleted, httpStatus: http.StatusOK, wantDone: true},
+		"succeeded":  {state: "SUCCEEDED", httpStatus: http.StatusOK, wantDone: true},
+		"failed":     {state: stateFailed, httpStatus: http.StatusOK, wantErr: true, wantRejected: true},
+		"status 400": {httpStatus: http.StatusBadRequest, wantErr: true, wantRejected: true},
+		"status 500": {httpStatus: http.StatusInternalServerError, wantErr: true, wantRejected: false},
 	}
+
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			mux := http.NewServeMux()
-			mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tc.status)
-			})
-			var server *httptest.Server
-			mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(http.StatusAccepted)
-				_, _ = w.Write([]byte(`{"statusUrl":"` + server.URL + `/status"}`))
-			})
-			server = httptest.NewServer(mux)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.httpStatus != http.StatusOK {
+					w.WriteHeader(tc.httpStatus)
+					return
+				}
+				_, _ = w.Write([]byte(`{"status":"` + tc.state + `","message":"m"}`))
+			}))
 			defer server.Close()
 
-			err := statusQueueReporter(server.URL).
-				ReportPorts(context.Background(), PortReport{ServiceName: testServiceName})
-			if err == nil {
-				t.Fatalf("expected an error for status URL returning %d", tc.status)
+			status, err := statusQueueReporter(server.URL).PollReport(context.Background(), server.URL)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected an error, got nil (status=%+v)", status)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected no error, got %v", err)
 			}
 			if got := errors.Is(err, ErrUpstreamRejected); got != tc.wantRejected {
-				t.Fatalf("status %d: errors.Is(err, ErrUpstreamRejected) = %v, want %v (err=%v)",
-					tc.status, got, tc.wantRejected, err)
+				t.Fatalf("errors.Is(err, ErrUpstreamRejected) = %v, want %v (err=%v)", got, tc.wantRejected, err)
+			}
+			if status.Done != tc.wantDone {
+				t.Fatalf("Done = %v, want %v", status.Done, tc.wantDone)
+			}
+			if status.Pending() != tc.wantPending {
+				t.Fatalf("Pending() = %v, want %v", status.Pending(), tc.wantPending)
+			}
+		})
+	}
+}
+
+// TestDeletePortsQueuedDoesNotBlock confirms that with the status queue enabled, a 2xx
+// withdrawal carrying a status URL returns a Pending ReportStatus without polling — the
+// controller drives withdrawal polling via PollReport across reconciles, holding its
+// finalizer, so no worker is held here.
+func TestDeletePortsQueuedDoesNotBlock(t *testing.T) {
+	var polled bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+		polled = true
+		_, _ = w.Write([]byte(`{"status":"` + statePending + `"}`))
+	})
+	var server *httptest.Server
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"statusUrl":"` + server.URL + `/status","jobId":"w1"}`))
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	status, err := statusQueueReporter(server.URL).
+		DeletePorts(context.Background(), PortReport{ServiceName: testServiceName})
+	if err != nil {
+		t.Fatalf("DeletePorts: %v", err)
+	}
+	if !status.Pending() {
+		t.Fatalf("expected a pending ReportStatus for a queued withdrawal, got %+v", status)
+	}
+	if status.StatusURL != server.URL+"/status" || status.JobID != "w1" {
+		t.Fatalf("expected the queued job's status URL and ID, got %+v", status)
+	}
+	if polled {
+		t.Fatal("DeletePorts polled the status URL; polling must be driven by PollReport")
+	}
+}
+
+// TestDeletePortsSyncCompletion confirms a 2xx withdrawal with no status URL is treated
+// as immediate success (Done), both with the status queue off and on.
+func TestDeletePortsSyncCompletion(t *testing.T) {
+	for name, queue := range map[string]bool{"queue off": false, "queue on": true} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer server.Close()
+
+			reporter := NewHTTPReporter(server.URL, false)
+			reporter.ReportingStatusQueue = queue
+			status, err := reporter.DeletePorts(context.Background(), PortReport{ServiceName: testServiceName})
+			if err != nil {
+				t.Fatalf("DeletePorts: %v", err)
+			}
+			if !status.Done {
+				t.Fatalf("expected Done for a synchronous withdrawal, got %+v", status)
 			}
 		})
 	}

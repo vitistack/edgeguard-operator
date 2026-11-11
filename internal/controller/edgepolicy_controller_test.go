@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -26,7 +27,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -43,6 +48,9 @@ const (
 	deleteServiceName = "delete-service"
 	// dcEast is a representative datacenter value reused across fixtures (goconst).
 	dcEast = "no-east-az1"
+	// queuedJobStatusURL is the placeholder status URL of a queued upstream job, reused
+	// across the async report/withdrawal tests (goconst).
+	queuedJobStatusURL = "https://upstream.test/jobs/j1"
 )
 
 var _ = Describe("EdgePolicy Controller", func() {
@@ -1623,7 +1631,403 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(readyNow.Reason).To(Equal(reasonServiceProtected))
 		})
 	})
+
+	Context("When a status write hits an optimistic-concurrency conflict", func() {
+		It("requeues quietly so an in-flight retry is not dropped", func() {
+			// A conflict on the status subresource must not silently drop the request:
+			// status-only writes are suppressed by the reconcile predicate, so without a
+			// requeue nothing would re-enqueue the policy and an upstream status-queue
+			// poll retry would stall. See conflictRequeueInterval.
+			policy := &securityv1alpha1.EdgePolicy{
+				Name:       "conflict-policy",
+				Namespace:  "default",
+				Finalizers: []string{edgePolicyFinalizer},
+				Spec: securityv1alpha1.EdgePolicySpec{
+					TargetRef: securityv1alpha1.TargetReference{
+						APIVersion: "v1",
+						Kind:       kindService,
+						Name:       "missing-service",
+					},
+				},
+			}
+
+			// Fail every status update with a conflict, driving the reconcile's conflict
+			// softening path. The target Service is absent, so the reconcile reaches the
+			// ServiceNotFound status write with the least fixture setup.
+			conflictClient := fake.NewClientBuilder().
+				WithScheme(k8sClient.Scheme()).
+				WithObjects(policy).
+				WithStatusSubresource(policy).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourceUpdate: func(_ context.Context, _ client.Client, _ string,
+						_ client.Object, _ ...client.SubResourceUpdateOption) error {
+						return errors.NewConflict(
+							schema.GroupResource{Group: "security.vitistack.io", Resource: "edgepolicies"},
+							policy.Name, fmt.Errorf("the object has been modified"))
+					},
+				}).
+				Build()
+
+			reconciler := &EdgePolicyReconciler{
+				Client: conflictClient,
+				Scheme: conflictClient.Scheme(),
+			}
+
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{
+				Name: policy.Name, Namespace: policy.Namespace,
+			})
+
+			By("softening the conflict to a nil error")
+			Expect(err).NotTo(HaveOccurred())
+
+			By("requeuing so the policy is reconciled again rather than stalling")
+			Expect(result.RequeueAfter).To(Equal(conflictRequeueInterval))
+		})
+	})
+
+	Context("When the upstream queues the report for asynchronous processing", func() {
+		ctx := context.Background()
+
+		It("records the pending job, polls it without blocking, and settles once it completes", func() {
+			reporter := &fakeReporter{
+				pending:    upstream.ReportStatus{StatusURL: queuedJobStatusURL, JobID: "j1"},
+				pollStatus: upstream.ReportStatus{StatusURL: queuedJobStatusURL}, // still pending
+			}
+			reconciler := &EdgePolicyReconciler{
+				Client:               k8sClient,
+				Scheme:               k8sClient.Scheme(),
+				Reporter:             reporter,
+				UpstreamPollInterval: 40 * time.Millisecond,
+			}
+			policyKey := provisionProtectedPolicy(ctx, "queued-policy")
+
+			By("reconciling: first adds the finalizer, second submits and queues the report")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("requeuing after the poll interval rather than blocking on the queued job")
+			Expect(result.RequeueAfter).To(Equal(40 * time.Millisecond))
+			Expect(reporter.reportAttempts).To(Equal(1))
+			Expect(reporter.polls).To(Equal(0))
+
+			By("recording the in-flight job on status.PendingReport without advancing ObservedPorts")
+			queued := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, queued)).To(Succeed())
+			Expect(queued.Status.PendingReport).NotTo(BeNil())
+			Expect(queued.Status.PendingReport.StatusURL).To(Equal(queuedJobStatusURL))
+			Expect(queued.Status.PendingReport.JobID).To(Equal("j1"))
+			Expect(queued.Status.PendingReport.Key).NotTo(BeEmpty())
+			Expect(queued.Status.PendingReport.Ports).To(HaveLen(1))
+			Expect(queued.Status.ObservedPorts).To(BeEmpty())
+			upstreamCond := meta.FindStatusCondition(queued.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(upstreamCond).NotTo(BeNil())
+			Expect(upstreamCond.Reason).To(Equal(reasonUpstreamPending))
+
+			By("polling again while the job is still pending: no resubmit, requeue again")
+			result, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(40 * time.Millisecond))
+			Expect(reporter.reportAttempts).To(Equal(1)) // did not resubmit
+			Expect(reporter.polls).To(Equal(1))
+
+			By("completing the job upstream and reconciling once more")
+			reporter.pollStatus = upstream.ReportStatus{Done: true}
+			result, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+
+			By("clearing the pending job, recording ObservedPorts, and marking Ready")
+			settled := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, settled)).To(Succeed())
+			Expect(settled.Status.PendingReport).To(BeNil())
+			Expect(settled.Status.ObservedPorts).To(HaveLen(1))
+			Expect(settled.Status.ObservedPorts[0].Port).To(Equal(int32(443)))
+			Expect(meta.FindStatusCondition(settled.Status.Conditions, conditionTypeUpstreamReady)).To(BeNil())
+			ready := meta.FindStatusCondition(settled.Status.Conditions, conditionTypeReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionTrue))
+			Expect(ready.Reason).To(Equal(reasonServiceProtected))
+			Expect(reporter.reports).To(HaveLen(1)) // exactly one submission across the whole flow
+		})
+
+		It("treats a failed queued job as a terminal rejection and then suppresses the identical retry", func() {
+			reporter := &fakeReporter{
+				pending: upstream.ReportStatus{StatusURL: "https://upstream.test/jobs/j2", JobID: "j2"},
+				pollErr: fmt.Errorf("%w: job failed: boom", upstream.ErrUpstreamRejected),
+			}
+			reconciler := &EdgePolicyReconciler{
+				Client:               k8sClient,
+				Scheme:               k8sClient.Scheme(),
+				Reporter:             reporter,
+				UpstreamPollInterval: 40 * time.Millisecond,
+			}
+			policyKey := provisionProtectedPolicy(ctx, "rejected-job-policy")
+
+			By("reconciling to submit and queue the report")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("polling the job, which fails: terminal rejection, no timed requeue")
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+
+			By("surfacing the rejection and clearing the pending job")
+			rejected := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, rejected)).To(Succeed())
+			Expect(rejected.Status.PendingReport).To(BeNil())
+			Expect(rejected.Status.RejectedReportKey).NotTo(BeEmpty())
+			upstreamCond := meta.FindStatusCondition(rejected.Status.Conditions, conditionTypeUpstreamReady)
+			Expect(upstreamCond).NotTo(BeNil())
+			Expect(upstreamCond.Reason).To(Equal(reasonUpstreamRejected))
+
+			By("suppressing the identical report on the next reconcile: no resubmit, no new poll")
+			attempts, polls := reporter.reportAttempts, reporter.polls
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reporter.reportAttempts).To(Equal(attempts))
+			Expect(reporter.polls).To(Equal(polls))
+		})
+	})
+
+	Context("When the upstream queues the withdrawal for asynchronous processing", func() {
+		ctx := context.Background()
+
+		It("holds the finalizer and polls a queued withdrawal, releasing only once it completes", func() {
+			reporter := &fakeReporter{}
+			reconciler := &EdgePolicyReconciler{
+				Client:               k8sClient,
+				Scheme:               k8sClient.Scheme(),
+				Reporter:             reporter,
+				UpstreamPollInterval: 40 * time.Millisecond,
+			}
+			policyKey := provisionProtectedPolicy(ctx, "withdraw-policy")
+
+			By("reconciling to a protected steady state with a recorded report")
+			for range 2 {
+				_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+				Expect(err).NotTo(HaveOccurred())
+			}
+			protected := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, protected)).To(Succeed())
+			Expect(protected.Status.ObservedPorts).To(HaveLen(1))
+
+			By("queueing the withdrawal upstream and deleting the EdgePolicy")
+			reporter.deletePending = upstream.ReportStatus{StatusURL: "https://upstream.test/withdrawals/w1", JobID: "w1"}
+			reporter.pollStatus = upstream.ReportStatus{StatusURL: "https://upstream.test/withdrawals/w1"} // still pending
+			Expect(k8sClient.Delete(ctx, protected)).To(Succeed())
+
+			By("reconciling: submits the withdrawal, records the job, and keeps the finalizer")
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(40 * time.Millisecond))
+
+			deleting := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, deleting)).To(Succeed())
+			Expect(controllerutil.ContainsFinalizer(deleting, edgePolicyFinalizer)).To(BeTrue())
+			Expect(deleting.Status.PendingWithdrawal).NotTo(BeNil())
+			Expect(deleting.Status.PendingWithdrawal.StatusURL).To(Equal("https://upstream.test/withdrawals/w1"))
+			Expect(deleting.Status.PendingWithdrawal.JobID).To(Equal("w1"))
+			Expect(reporter.deletes).To(HaveLen(1))
+
+			By("polling again while the withdrawal is still pending: keep the finalizer, do not resubmit")
+			result, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(40 * time.Millisecond))
+			Expect(reporter.deletes).To(HaveLen(1))
+			still := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, still)).To(Succeed())
+			Expect(controllerutil.ContainsFinalizer(still, edgePolicyFinalizer)).To(BeTrue())
+
+			By("completing the withdrawal upstream: the finalizer is released and the object is removed")
+			reporter.pollStatus = upstream.ReportStatus{Done: true}
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, policyKey, &securityv1alpha1.EdgePolicy{}))
+			}).Should(BeTrue())
+		})
+
+		It("withdraws a report that was still queued when the policy was deleted", func() {
+			// The report is accepted asynchronously and the policy is deleted before the
+			// job completes, so ObservedPorts was never recorded. The withdrawal must still
+			// be sent — reconstructed from the in-flight report's payload — so the queued
+			// upstream job is cancelled rather than orphaned.
+			reporter := &fakeReporter{
+				pending: upstream.ReportStatus{StatusURL: queuedJobStatusURL, JobID: "j1"},
+			}
+			reconciler := &EdgePolicyReconciler{
+				Client:               k8sClient,
+				Scheme:               k8sClient.Scheme(),
+				Reporter:             reporter,
+				UpstreamPollInterval: 40 * time.Millisecond,
+			}
+			policyKey := provisionProtectedPolicy(ctx, "deleted-while-queued-policy")
+
+			By("reconciling until the first report is queued but not yet accepted")
+			for range 2 {
+				_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+				Expect(err).NotTo(HaveOccurred())
+			}
+			queued := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, queued)).To(Succeed())
+			Expect(queued.Status.PendingReport).NotTo(BeNil())
+			Expect(queued.Status.ObservedPorts).To(BeEmpty())
+			pendingKey := queued.Status.PendingReport.Key
+
+			By("deleting the EdgePolicy while its first report is still in flight")
+			Expect(k8sClient.Delete(ctx, queued)).To(Succeed())
+
+			By("reconciling the deletion: a withdrawal is sent for the still-queued report")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reporter.deletes).To(HaveLen(1))
+
+			By("confirming the withdrawal carries the queued report's payload and idempotency key")
+			Expect(reporter.deletes[0].IdempotencyKey()).To(Equal(pendingKey))
+			Expect(reporter.deletes[0].Filter.ObservedPorts).To(HaveLen(1))
+			Expect(reporter.deletes[0].Filter.ObservedPorts[0].Port).To(Equal(int32(443)))
+			Expect(reporter.deletes[0].IPv4Addresses).To(ConsistOf("203.0.113.10"))
+
+			By("confirming the object is removed once the withdrawal completes")
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, policyKey, &securityv1alpha1.EdgePolicy{}))
+			}).Should(BeTrue())
+		})
+
+		It("withdraws both the accepted report and a newer in-flight one when deleted", func() {
+			// An accepted report (ObservedPorts) and a distinct, still-queued newer report
+			// (PendingReport) can both be live upstream at deletion. Each has a different
+			// idempotency key, so both must be withdrawn — one per reconcile.
+			reporter := &fakeReporter{}
+			reconciler := &EdgePolicyReconciler{
+				Client:               k8sClient,
+				Scheme:               k8sClient.Scheme(),
+				Reporter:             reporter,
+				UpstreamPollInterval: 40 * time.Millisecond,
+			}
+			policyKey := provisionProtectedPolicy(ctx, "two-payload-policy")
+			serviceKey := types.NamespacedName{Name: "two-payload-policy-svc", Namespace: "default"}
+
+			By("reconciling until the first report is accepted synchronously")
+			for range 2 {
+				_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+				Expect(err).NotTo(HaveOccurred())
+			}
+			accepted := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, accepted)).To(Succeed())
+			Expect(accepted.Status.ObservedPorts).To(HaveLen(1))
+			Expect(accepted.Status.PendingReport).To(BeNil())
+
+			By("adding a port and letting the re-report queue without completing")
+			reporter.pending = upstream.ReportStatus{StatusURL: queuedJobStatusURL, JobID: "j2"}
+			service := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, serviceKey, service)).To(Succeed())
+			// A Service with more than one port requires each port to be named.
+			service.Spec.Ports = []corev1.ServicePort{
+				{Name: "https", Port: 443},
+				{Name: "alt", Port: 8080},
+			}
+			Expect(k8sClient.Update(ctx, service)).To(Succeed())
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			queued := &securityv1alpha1.EdgePolicy{}
+			Expect(k8sClient.Get(ctx, policyKey, queued)).To(Succeed())
+			Expect(queued.Status.ObservedPorts).To(HaveLen(1))       // still the accepted single port
+			Expect(queued.Status.PendingReport.Ports).To(HaveLen(2)) // the queued two-port report
+
+			By("deleting the policy and reconciling until both payloads are withdrawn")
+			Expect(k8sClient.Delete(ctx, queued)).To(Succeed())
+			Eventually(func() bool {
+				_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+				return errors.IsNotFound(k8sClient.Get(ctx, policyKey, &securityv1alpha1.EdgePolicy{}))
+			}).Should(BeTrue())
+
+			By("confirming two withdrawals were sent with distinct payloads and keys")
+			Expect(reporter.deletes).To(HaveLen(2))
+			Expect(reporter.deletes[0].Filter.ObservedPorts).To(HaveLen(1)) // accepted payload first
+			Expect(reporter.deletes[1].Filter.ObservedPorts).To(HaveLen(2)) // then the in-flight one
+			Expect(reporter.deletes[0].IdempotencyKey()).NotTo(Equal(reporter.deletes[1].IdempotencyKey()))
+		})
+	})
 })
+
+// provisionProtectedPolicy creates a filter-enabled EdgePolicy, its LoadBalancer target
+// Service (with one ingress IP and an ipam.vitistack.io/secret annotation), the Secret
+// that annotation references, and the kube-system namespace used for the cluster UID —
+// wiring DeferCleanup for each. It returns the policy key so a test can reconcile and
+// assert. Names are derived from the given base so parallel specs do not collide.
+func provisionProtectedPolicy(ctx context.Context, name string) types.NamespacedName {
+	const namespace = "default"
+	serviceName := name + "-svc"
+	secretName := name + "-secret"
+	policyKey := types.NamespacedName{Name: name, Namespace: namespace}
+	serviceKey := types.NamespacedName{Name: serviceName, Namespace: namespace}
+
+	policy := &securityv1alpha1.EdgePolicy{
+		Name:      name,
+		Namespace: namespace,
+		Spec: securityv1alpha1.EdgePolicySpec{
+			Datacenter: dcEast,
+			TargetRef: securityv1alpha1.TargetReference{
+				APIVersion: "v1",
+				Kind:       kindService,
+				Name:       serviceName,
+			},
+			Filter: &securityv1alpha1.FilterSpec{Enabled: true},
+		},
+	}
+	Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+	DeferCleanup(func() {
+		fetched := &securityv1alpha1.EdgePolicy{}
+		if err := k8sClient.Get(ctx, policyKey, fetched); err == nil {
+			controllerutil.RemoveFinalizer(fetched, edgePolicyFinalizer)
+			Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+		}
+	})
+
+	service := &corev1.Service{
+		Name:        serviceName,
+		Namespace:   namespace,
+		Annotations: map[string]string{secretAnnotation: secretName},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{Port: 443}},
+		},
+	}
+	Expect(k8sClient.Create(ctx, service)).To(Succeed())
+	service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "203.0.113.10"}}
+	Expect(k8sClient.Status().Update(ctx, service)).To(Succeed())
+	DeferCleanup(func() {
+		fetched := &corev1.Service{}
+		if err := k8sClient.Get(ctx, serviceKey, fetched); err == nil {
+			controllerutil.RemoveFinalizer(fetched, serviceFinalizer)
+			Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
+		}
+	})
+
+	kubeSystem := &corev1.Namespace{Name: "kube-system"}
+	if err := k8sClient.Create(ctx, kubeSystem); err != nil {
+		Expect(errors.IsAlreadyExists(err)).To(BeTrue())
+	}
+
+	secret := &corev1.Secret{
+		Name:      secretName,
+		Namespace: namespace,
+		Data:      map[string][]byte{secretDataKey: []byte("s3cr3t")},
+	}
+	Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+	DeferCleanup(func() { _ = k8sClient.Delete(ctx, secret) })
+
+	return policyKey
+}
 
 // fakeReporter is a test Reporter that records every report and delete it receives.
 type fakeReporter struct {
@@ -1636,24 +2040,49 @@ type fakeReporter struct {
 	// deleteErr, when set, is returned by DeletePorts (taking precedence over err) so a
 	// test can fail a withdrawal while letting the initial report succeed.
 	deleteErr error
+	// pending, when its StatusURL is set, is returned by a successful ReportPorts to
+	// drive the asynchronous status-queue path; otherwise ReportPorts reports Done.
+	pending upstream.ReportStatus
+	// deletePending, when its StatusURL is set, is returned by a successful DeletePorts
+	// to drive the asynchronous withdrawal path; otherwise DeletePorts reports Done.
+	deletePending upstream.ReportStatus
+	// pollStatus and pollErr are returned by PollReport, and polls counts its calls, so
+	// a test can script an in-flight job polling to completion, failure, or still-pending.
+	pollStatus upstream.ReportStatus
+	pollErr    error
+	polls      int
 }
 
-func (f *fakeReporter) ReportPorts(_ context.Context, report upstream.PortReport) error {
+func (f *fakeReporter) ReportPorts(_ context.Context, report upstream.PortReport) (upstream.ReportStatus, error) {
 	f.reportAttempts++
 	if f.err != nil {
-		return f.err
+		return upstream.ReportStatus{}, f.err
 	}
 	f.reports = append(f.reports, report)
-	return nil
+	if f.pending.StatusURL != "" {
+		return f.pending, nil
+	}
+	return upstream.ReportStatus{Done: true}, nil
 }
 
-func (f *fakeReporter) DeletePorts(_ context.Context, report upstream.PortReport) error {
+func (f *fakeReporter) PollReport(_ context.Context, _ string) (upstream.ReportStatus, error) {
+	f.polls++
+	if f.pollErr != nil {
+		return upstream.ReportStatus{}, f.pollErr
+	}
+	return f.pollStatus, nil
+}
+
+func (f *fakeReporter) DeletePorts(_ context.Context, report upstream.PortReport) (upstream.ReportStatus, error) {
 	if f.deleteErr != nil {
-		return f.deleteErr
+		return upstream.ReportStatus{}, f.deleteErr
 	}
 	if f.err != nil {
-		return f.err
+		return upstream.ReportStatus{}, f.err
 	}
 	f.deletes = append(f.deletes, report)
-	return nil
+	if f.deletePending.StatusURL != "" {
+		return f.deletePending, nil
+	}
+	return upstream.ReportStatus{Done: true}, nil
 }

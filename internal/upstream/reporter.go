@@ -195,17 +195,44 @@ func (r PortReport) IdempotencyKey() string {
 	return hex.EncodeToString(sum[:])
 }
 
+// ReportStatus is the outcome of submitting or polling an upstream report. A report
+// is either Done (durably accepted upstream, nothing more to do) or still in flight,
+// in which case StatusURL names the URL to poll for its outcome and JobID identifies
+// the queued job for logging. A terminal rejection or a transient delivery failure is
+// returned as a non-nil error, not encoded in a ReportStatus.
+type ReportStatus struct {
+	// Done is true when the report has been durably accepted upstream.
+	Done bool
+	// StatusURL, when non-empty, is the URL to poll for a queued job that is still in
+	// flight. It is meaningful only when Done is false.
+	StatusURL string
+	// JobID identifies the queued job, for logging and correlation.
+	JobID string
+}
+
+// Pending reports whether the report is still in flight: queued, not yet accepted,
+// and carrying a StatusURL the caller must poll.
+func (s ReportStatus) Pending() bool { return !s.Done && s.StatusURL != "" }
+
 // Reporter reports discovered Service ports to an external upstream system.
 //
-// Implementations must be safe for concurrent use: the controller may invoke
-// ReportPorts from multiple reconciles at once. ReportPorts should return a
-// non-nil error when the report was not durably accepted upstream so the
-// controller can requeue and retry. DeletePorts withdraws a previously reported
-// set of ports when the policy or its target Service is removed, with the same
-// retry semantics.
+// Implementations must be safe for concurrent use: the controller may invoke these
+// methods from multiple reconciles at once. Each method performs a single upstream
+// round-trip and does not block waiting on a queued job; the controller drives any
+// polling across reconciles so a worker is never held waiting on the upstream.
+//
+// ReportPorts submits a report and returns its outcome: Done when the upstream
+// accepted it synchronously, or a Pending ReportStatus carrying a StatusURL when the
+// upstream queued it for asynchronous processing. PollReport performs one poll of such
+// a StatusURL and is shared by reports and withdrawals. DeletePorts withdraws a
+// previously reported set of ports when the policy or its target Service is removed,
+// with the same submit/poll contract as ReportPorts. Each returns a non-nil error
+// (ErrUpstreamRejected / ErrIncompleteReport / a plain transient error) when the
+// operation was not durably accepted, so the controller can requeue and retry.
 type Reporter interface {
-	ReportPorts(ctx context.Context, report PortReport) error
-	DeletePorts(ctx context.Context, report PortReport) error
+	ReportPorts(ctx context.Context, report PortReport) (ReportStatus, error)
+	PollReport(ctx context.Context, statusURL string) (ReportStatus, error)
+	DeletePorts(ctx context.Context, report PortReport) (ReportStatus, error)
 }
 
 // NoopReporter is a Reporter that discards every report and reports success. It
@@ -213,11 +240,21 @@ type Reporter interface {
 // was delivered, without contacting any upstream or surfacing a failure.
 type NoopReporter struct{}
 
-// ReportPorts implements Reporter and does nothing.
-func (NoopReporter) ReportPorts(context.Context, PortReport) error { return nil }
+// ReportPorts implements Reporter and reports immediate success without polling.
+func (NoopReporter) ReportPorts(context.Context, PortReport) (ReportStatus, error) {
+	return ReportStatus{Done: true}, nil
+}
 
-// DeletePorts implements Reporter and does nothing.
-func (NoopReporter) DeletePorts(context.Context, PortReport) error { return nil }
+// PollReport implements Reporter and reports immediate success; a NoopReporter never
+// queues a job, so there is nothing to poll.
+func (NoopReporter) PollReport(context.Context, string) (ReportStatus, error) {
+	return ReportStatus{Done: true}, nil
+}
+
+// DeletePorts implements Reporter and reports immediate success without polling.
+func (NoopReporter) DeletePorts(context.Context, PortReport) (ReportStatus, error) {
+	return ReportStatus{Done: true}, nil
+}
 
 // Configured reports true so the controller treats disabled reporting as healthy
 // (no UpstreamReady=False condition) rather than as a missing configuration.

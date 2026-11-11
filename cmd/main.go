@@ -280,11 +280,12 @@ func main() {
 		}
 		httpReporter.ReportingStatusQueue = upstreamReportingStatusQueue
 		if upstreamReportingStatusQueue {
-			httpReporter.StatusPollInterval = upstreamStatusQueuePollInterval
-			httpReporter.StatusPollTimeout = upstreamStatusQueuePollTimeout
-			setupLog.Info("Upstream reporting status queue enabled; polling each report's status URL for completion",
-				"pollInterval", httpReporter.EffectiveStatusPollInterval(),
-				"pollTimeout", httpReporter.EffectiveStatusPollTimeout())
+			// Queued report and withdrawal jobs are polled non-blocking by the controller
+			// at its UpstreamPollInterval (wired from upstreamStatusQueuePollInterval
+			// below); the reporter itself no longer blocks on a queued job.
+			// upstreamStatusQueuePollTimeout is retained for flag/env compatibility but no
+			// longer bounds anything.
+			setupLog.Info("Upstream reporting status queue enabled; queued jobs are polled for completion by the controller")
 		}
 		if upstreamInsecureSkipVerify {
 			setupLog.Info("Upstream TLS verification disabled (UPSTREAM_INSECURE_SKIP_VERIFY); " +
@@ -295,9 +296,10 @@ func main() {
 	}
 
 	if err := (&controller.EdgePolicyReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Reporter: reporter,
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Reporter:             reporter,
+		UpstreamPollInterval: upstreamStatusQueuePollInterval,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "edgepolicy")
 		os.Exit(1)
