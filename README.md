@@ -3,7 +3,7 @@
 > A Kubernetes operator that guards LoadBalancer Services at the edge — discovering their ports and ingress IPs, protecting them with finalizers, and reporting them to an upstream IPAM / edge API.
 
 <p>
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.27.2+-00ADD8?logo=go&logoColor=white">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.27.4+-00ADD8?logo=go&logoColor=white">
   <img alt="Kubernetes" src="https://img.shields.io/badge/Kubernetes-1.31+-326CE5?logo=kubernetes&logoColor=white">
   <img alt="Kubebuilder" src="https://img.shields.io/badge/built%20with-Kubebuilder-326CE5?logo=kubernetes&logoColor=white">
   <img alt="API" src="https://img.shields.io/badge/API-security.vitistack.io%2Fv1alpha1-blue">
@@ -150,6 +150,7 @@ The operator maintains three conditions on `.status.conditions`:
 | **UpstreamReady** | *(absent)* | Healthy — reporting succeeded, or is intentionally disabled. |
 | | `UpstreamNotConfigured` | `spec.filter` or `spec.ddos` is set but no `UPSTREAM_API_URL` is configured. |
 | | `UpstreamReportIncomplete` | The report is missing a field the upstream requires — the IPAM credential (`ipamSecret`) and/or a load balancer address — so it was **not** sent. Clears once the credential resolves and the Service has an ingress IP. |
+| | `UpstreamReportPending` | With the status queue enabled, the report was accepted as a **queued job** and the operator is polling its status URL for completion (one poll per reconcile — non-blocking). A transient in-progress state recorded alongside `.status.pendingReport`. |
 | | `UpstreamReportFailed` | Configured, but the last report failed **transiently** (connectivity, or a `5xx`); a retry is pending. |
 | | `UpstreamReportRejected` | The upstream refused the report with a **`4xx`** client error (or, with the status queue enabled, the queued job **failed**). Treated as **terminal**: the operator stops retrying on the timer and suppresses the identical payload (remembered via `.status.rejectedReportKey`), re-attempting only when the report content changes. The upstream's detail is surfaced on `.status.rejectedReportMessage` and in this condition's message. |
 
@@ -164,9 +165,9 @@ The manager is configured with environment variables (each also has an equivalen
 | `UPSTREAM_API_URL` | `--upstream-url` | *(empty)* | Base URL of the upstream API that receives port reports, e.g. `https://ipam-api.vitistack.io/v2`. When empty, policies with a `spec.filter` or `spec.ddos` block report `UpstreamReady=False/UpstreamNotConfigured`. |
 | `UPSTREAM_REPORTING_DISABLED` | `--disable-upstream-reporting` | `false` | When truthy (`1`, `t`, `true`, …), upstream reporting is **disabled**: every report is treated as successfully delivered without any outbound call, and no failure condition is raised. **Takes precedence over `UPSTREAM_API_URL`.** |
 | `UPSTREAM_INSECURE_SKIP_VERIFY` | `--upstream-insecure-skip-verify` | `false` | When truthy, **skips upstream TLS certificate verification**. For trusted dev/test mirrors with self-signed certificates only — **do not enable in production**. Prefer mounting a CA bundle (see the Helm chart's `manager.caBundle`). |
-| `UPSTREAM_REPORTING_STATUS_QUEUE` | `--upstream-reporting-status-queue` | `false` | When truthy, enables the **asynchronous status queue**: an accepted report is not treated as final — the upstream returns a status URL that the operator polls until the queued job reports completion (success) or failure. Ignored when reporting is disabled. See [Reporting status queue](#-reporting-status-queue-async). |
-| `UPSTREAM_REPORTING_STATUS_QUEUE_POLL_INTERVAL` | `--upstream-reporting-status-queue-poll-interval` | `2s` | Delay between polls of a report's status URL while the queued job is still pending (Go duration, e.g. `2s`, `500ms`). An unset/invalid value falls back to the default. Only used when the status queue is enabled. |
-| `UPSTREAM_REPORTING_STATUS_QUEUE_POLL_TIMEOUT` | `--upstream-reporting-status-queue-poll-timeout` | `30s` | How long one report attempt polls the status URL for a terminal state before giving up and letting the controller requeue (Go duration, e.g. `30s`, `2m`). An unset/invalid value falls back to the default. Only used when the status queue is enabled. |
+| `UPSTREAM_REPORTING_STATUS_QUEUE` | `--upstream-reporting-status-queue` | `false` | When truthy, enables the **asynchronous status queue**: an accepted report (or withdrawal) is not treated as final — the upstream returns a status URL that the operator polls **non-blocking** (one poll per reconcile) until the queued job reports completion (success) or failure. Ignored when reporting is disabled. See [Reporting status queue](#-reporting-status-queue-async). |
+| `UPSTREAM_REPORTING_STATUS_QUEUE_POLL_INTERVAL` | `--upstream-reporting-status-queue-poll-interval` | `2s` | Delay before the controller polls a queued job's status URL again while it is still pending (Go duration, e.g. `2s`, `500ms`). Each reconcile performs a single poll and requeues after this interval, so a worker is never held waiting. An unset/invalid value falls back to the default. Only used when the status queue is enabled. |
+| `UPSTREAM_REPORTING_STATUS_QUEUE_POLL_TIMEOUT` | `--upstream-reporting-status-queue-poll-timeout` | `30s` | **Deprecated / no-op.** Queued jobs are now polled non-blocking by the controller (one poll per reconcile, requeued at the poll interval until terminal), so there is no per-attempt timeout budget. Retained only so existing manifests and flags keep parsing; it has no effect. |
 
 ### Reporting modes at a glance
 
@@ -180,7 +181,7 @@ The manager is configured with environment variables (each also has an equivalen
 >
 > A **`4xx`** response is treated as **terminal** (`UpstreamReportRejected`, also `Ready=False`): retrying the same payload will not help, so the operator does **not** requeue on the timer. It also **remembers the rejected report** (by its `Idempotency-Key`) on `.status.rejectedReportKey` and **suppresses re-sending that identical payload** on subsequent reconciles and Service events — it re-attempts only once the report content actually changes (which yields a different key), or clears the memory when a report is accepted. The upstream's rejection detail is persisted on `.status.rejectedReportMessage` and echoed in the `UpstreamReady` condition message, so the reason is visible directly on the CR. During deletion, a `4xx` on the withdrawal is skipped rather than retried, so a rejected withdrawal never blocks the object from deleting.
 >
-> With the **status queue** enabled (`UPSTREAM_REPORTING_STATUS_QUEUE=true`), an accepted submission only means the job was *queued*: the operator then polls the returned status URL until it reports success or failure. A **failed job** is mapped to the same terminal `UpstreamReportRejected` path (its message surfaced on `.status.rejectedReportMessage`); a poll **timeout** is treated as transient (requeued), and the next attempt resumes the same job via the `Idempotency-Key`. See [Reporting status queue](#-reporting-status-queue-async).
+> With the **status queue** enabled (`UPSTREAM_REPORTING_STATUS_QUEUE=true`), an accepted submission only means the job was *queued*: the operator records the returned status URL on `.status.pendingReport` and polls it **non-blocking** — one poll per reconcile, requeued at the poll interval — until it reports success or failure, so a reconcile worker is never held waiting. A **failed job** is mapped to the same terminal `UpstreamReportRejected` path (its message surfaced on `.status.rejectedReportMessage`); a transient poll error (`5xx` on the status `GET`) is requeued and the stored status URL is re-polled on the next reconcile. See [Reporting status queue](#-reporting-status-queue-async).
 
 ---
 
@@ -245,7 +246,7 @@ Every report carries an **`Idempotency-Key`** HTTP header so the upstream can sa
 
 ### 🔁 Reporting status queue (async)
 
-By default an accepted (`2xx`) report is final. When `UPSTREAM_REPORTING_STATUS_QUEUE=true`, reporting becomes **two-phase**: the upstream enqueues the report as a job and the operator polls for its outcome.
+By default an accepted (`2xx`) report is final. When `UPSTREAM_REPORTING_STATUS_QUEUE=true`, reporting becomes **two-phase**: the upstream enqueues the report as a job and the operator polls for its outcome **non-blocking** — it records the job on the CR status and does a single poll per reconcile, so a worker is never held waiting on the upstream. Withdrawals (`DELETE`) are handled the same way, with the finalizer held until the withdrawal job completes.
 
 1. **Submit** — the `POST`/`DELETE` returns `2xx` with a status URL in the body:
 
@@ -253,9 +254,9 @@ By default an accepted (`2xx`) report is final. When `UPSTREAM_REPORTING_STATUS_
    { "statusUrl": "https://ipam-api.vitistack.io/jobs/9f3c1a2e", "jobId": "9f3c1a2e" }
    ```
 
-   An empty/absent `statusUrl` means the upstream completed the report synchronously — it is treated as immediate success.
+   An empty/absent `statusUrl` means the upstream completed the report synchronously — it is treated as immediate success. Otherwise the job is recorded on `.status.pendingReport` (or `.status.pendingWithdrawal` for a `DELETE`).
 
-2. **Poll** — the operator `GET`s the status URL every `UPSTREAM_REPORTING_STATUS_QUEUE_POLL_INTERVAL` (default `2s`), up to a budget of `UPSTREAM_REPORTING_STATUS_QUEUE_POLL_TIMEOUT` (default `30s`) per attempt:
+2. **Poll** — once per reconcile the operator `GET`s the stored status URL and then requeues after `UPSTREAM_REPORTING_STATUS_QUEUE_POLL_INTERVAL` (default `2s`) while the job is still pending — there is no per-attempt timeout budget, so polling continues across reconciles until the job reaches a terminal state:
 
    ```json
    { "status": "completed", "message": "Ports reported successfully" }
@@ -264,25 +265,25 @@ By default an accepted (`2xx`) report is final. When `UPSTREAM_REPORTING_STATUS_
    The `status` is matched case-insensitively. Recognized terminal values:
    - **success** → `completed`, `complete`, `succeeded`, `success`, `done`
    - **failure** → `failed`, `failure`, `error`, `rejected`, `cancelled`, `canceled`
-   - anything else (`pending`, `running`, `queued`, …) keeps polling until the budget is spent.
+   - anything else (`pending`, `running`, `queued`, …) requeues and is polled again on the next reconcile.
 
 Outcome mapping (reuses the existing status machinery):
 
 | Poll result | Treated as | Status |
 |-------------|-----------|--------|
-| terminal **success** | report accepted | `UpstreamReady` cleared (healthy) |
+| terminal **success** | report accepted | `UpstreamReady` cleared (healthy); `.status.pendingReport` cleared |
 | terminal **failure** | **terminal rejection** | `UpstreamReportRejected`; `message` persisted on `.status.rejectedReportMessage` |
-| **poll timeout** / transient poll error (`5xx`) | transient | requeued; next attempt resumes the **same** job via the `Idempotency-Key` |
+| transient poll error (`5xx`) | transient | requeued; the stored status URL is re-polled on the next reconcile |
 | status URL returns `4xx` | terminal rejection | `UpstreamReportRejected` |
 
-> **Note:** the field names (`statusUrl`/`jobId`/`status`/`message`) and the recognized status values are the operator's assumed contract (marked `TODO(user)` in `internal/upstream/http_reporter.go`). Align them with your real upstream API. A failed job is mapped to a **terminal** rejection by default; if your job failures are usually transient, change that mapping in `awaitStatusQueue`.
+> **Note:** the field names (`statusUrl`/`jobId`/`status`/`message`) and the recognized status values are the operator's assumed contract (marked `TODO(user)` in `internal/upstream/http_reporter.go`). Align them with your real upstream API. A failed job is mapped to a **terminal** rejection by default; if your job failures are usually transient, change that mapping in `PollReport` (`internal/upstream/http_reporter.go`).
 
 ---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-- Go **v1.27.2+**
+- Go **v1.27.4+**
 - Docker **17.03+**
 - kubectl **v1.31+**
 - Access to a Kubernetes **v1.31+** cluster — required because the API contract uses **CEL validation rules** (`x-kubernetes-validations`), which need CRD validation expressions that are GA from Kubernetes 1.31.
@@ -366,7 +367,7 @@ helm install edgeguard ./chart/edgeguard-operator \
 
 Notable values (see `chart/edgeguard-operator/values.yaml`):
 
-- **`manager.upstream`** — upstream reporting configuration, rendered into the `UPSTREAM_*` environment variables: `apiUrl`, `reportingDisabled`, `insecureSkipVerify`, and the status queue (`reportingStatusQueue`, `reportingStatusQueuePollInterval`, `reportingStatusQueuePollTimeout`). Use `manager.env` for any additional variables.
+- **`manager.upstream`** — upstream reporting configuration, rendered into the `UPSTREAM_*` environment variables: `apiUrl`, `reportingDisabled`, `insecureSkipVerify`, and the status queue (`reportingStatusQueue`, `reportingStatusQueuePollInterval`, and the deprecated no-op `reportingStatusQueuePollTimeout`). Use `manager.env` for any additional variables.
 - **`manager.caBundle`** — mount a CA certificate bundle from a ConfigMap so the manager can verify TLS against an upstream signed by an internal/corporate CA (preferred over `UPSTREAM_INSECURE_SKIP_VERIFY`):
 
   ```sh
