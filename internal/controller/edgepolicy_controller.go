@@ -651,6 +651,19 @@ func filterEnabled(policy *securityv1alpha1.EdgePolicy) bool {
 	return policy.Spec.Filter != nil && policy.Spec.Filter.Enabled
 }
 
+// filterReport maps the policy's spec.filter block into the upstream payload. The
+// filter section is always present — a policy with no spec.filter block reports it
+// disabled (enabled=false), mirroring ddosReport — so the upstream always sees the
+// filter.enabled flag defaulted to false rather than a missing section. observed are
+// the ports discovered on the target Service; additionalPorts is always a non-nil slice.
+func filterReport(policy *securityv1alpha1.EdgePolicy, observed []upstream.Port) upstream.FilterReport {
+	return upstream.FilterReport{
+		Enabled:         filterEnabled(policy),
+		ObservedPorts:   observed,
+		AdditionalPorts: additionalPorts(policy),
+	}
+}
+
 // ddosReport maps the policy's spec.ddos block into the upstream payload
 // representation. When the policy declares no ddos block, a disabled report
 // (enabled=false) is returned rather than nil, so the upstream always sees the ddos
@@ -721,12 +734,8 @@ func (r *EdgePolicyReconciler) buildReport(ctx context.Context, policy *security
 		IpamSecret:            ipamSecret,
 		IPv4Addresses:         ipv4,
 		IPv6Addresses:         ipv6,
-		Filter: upstream.FilterReport{
-			Enabled:         filterEnabled(policy),
-			ObservedPorts:   observed,
-			AdditionalPorts: additionalPorts(policy),
-		},
-		DDoS: ddosReport(policy),
+		Filter:                filterReport(policy, observed),
+		DDoS:                  ddosReport(policy),
 	}, nil
 }
 
@@ -1005,12 +1014,8 @@ func (r *EdgePolicyReconciler) buildWithdrawalReport(ctx context.Context,
 		IpamSecret:            ipamSecret,
 		IPv4Addresses:         ipv4,
 		IPv6Addresses:         ipv6,
-		Filter: upstream.FilterReport{
-			Enabled:         filterEnabled(policy),
-			ObservedPorts:   observed,
-			AdditionalPorts: additionalPorts(policy),
-		},
-		DDoS: ddosReport(policy),
+		Filter:                filterReport(policy, observed),
+		DDoS:                  ddosReport(policy),
 	}, nil
 }
 

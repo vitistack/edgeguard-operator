@@ -223,7 +223,7 @@ Idempotency-Key: <sha256 hash>
 }
 ```
 
-- `filter.enabled` reflects `spec.filter.enabled` (whether discovery is on). It does **not** gate reporting: a report is sent whenever `spec.filter` is present and its content changes, including with `enabled: false`, so the upstream always tracks the current state. It is part of the `Idempotency-Key`, so toggling it produces a fresh report.
+- `filter` is **always present**: a policy with no `filter` block reports it disabled (`enabled: false`), mirroring how `ddos` is always sent. `filter.enabled` reflects `spec.filter.enabled` (whether discovery is on) and does **not** gate reporting — a report is sent whenever `spec.filter` or `spec.ddos` is present and its content changes, including with `filter.enabled: false`, so the upstream always tracks the current state. It is part of the `Idempotency-Key`, so toggling it produces a fresh report.
 - `filter.observedPorts` are the ports discovered on the target Service (TCP/UDP/SCTP).
 - `filter.additionalPorts` are the user-declared ports from `spec.filter.additionalPortList`, always present and serialized as `[]` when none are declared.
 - `ddos` mirrors `spec.ddos` and is **always present**: a policy with no `ddos` block reports it disabled (`enabled: false`, `additionalCidrList: []`), mirroring how `filter` is always sent. `ddos.enabled` reflects `spec.ddos.enabled`, `ddos.region` the permitted region (omitted when unset), and `ddos.additionalCidrList` the extra allowed CIDRs — always serialized as `[]` when none are declared. The whole `ddos` block is part of the `Idempotency-Key`, so any change to it produces a fresh report.

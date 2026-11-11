@@ -51,6 +51,8 @@ const (
 	// queuedJobStatusURL is the placeholder status URL of a queued upstream job, reused
 	// across the async report/withdrawal tests (goconst).
 	queuedJobStatusURL = "https://upstream.test/jobs/j1"
+	// portNameHTTPS is a representative Service port name reused across fixtures (goconst).
+	portNameHTTPS = "https"
 )
 
 var _ = Describe("EdgePolicy Controller", func() {
@@ -1154,7 +1156,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 				},
 				Spec: corev1.ServiceSpec{
 					Type:  corev1.ServiceTypeLoadBalancer,
-					Ports: []corev1.ServicePort{{Name: "https", Port: 443}},
+					Ports: []corev1.ServicePort{{Name: portNameHTTPS, Port: 443}},
 				},
 			}
 			Expect(k8sClient.Create(ctx, service)).To(Succeed())
@@ -1940,7 +1942,7 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(k8sClient.Get(ctx, serviceKey, service)).To(Succeed())
 			// A Service with more than one port requires each port to be named.
 			service.Spec.Ports = []corev1.ServicePort{
-				{Name: "https", Port: 443},
+				{Name: portNameHTTPS, Port: 443},
 				{Name: "alt", Port: 8080},
 			}
 			Expect(k8sClient.Update(ctx, service)).To(Succeed())
@@ -1965,6 +1967,26 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(reporter.deletes[1].Filter.ObservedPorts).To(HaveLen(2)) // then the in-flight one
 			Expect(reporter.deletes[0].IdempotencyKey()).NotTo(Equal(reporter.deletes[1].IdempotencyKey()))
 		})
+	})
+})
+
+var _ = Describe("filterReport", func() {
+	observed := []upstream.Port{{Name: portNameHTTPS, Port: 443, Protocol: "TCP"}}
+
+	It("defaults filter.enabled to false when the filter block is omitted", func() {
+		fr := filterReport(&securityv1alpha1.EdgePolicy{}, observed)
+		Expect(fr.Enabled).To(BeFalse())
+		// The section is still present (observed ports carried through, additionalPorts
+		// a non-nil slice) rather than omitted — mirroring ddosReport.
+		Expect(fr.ObservedPorts).To(HaveLen(1))
+		Expect(fr.AdditionalPorts).NotTo(BeNil())
+	})
+
+	It("reflects spec.filter.enabled when the filter block is present", func() {
+		fr := filterReport(&securityv1alpha1.EdgePolicy{
+			Spec: securityv1alpha1.EdgePolicySpec{Filter: &securityv1alpha1.FilterSpec{Enabled: true}},
+		}, observed)
+		Expect(fr.Enabled).To(BeTrue())
 	})
 })
 
