@@ -527,15 +527,18 @@ func (r *EdgePolicyReconciler) pollPendingReport(ctx context.Context, policy *se
 	return r.awaitPending(ctx, policy, baseChanged)
 }
 
-// awaitPending marks UpstreamReady as pending for an in-flight report job, persists the
-// status when changed, and requeues after the poll interval so the job is polled again.
-// It deliberately leaves the Ready condition unchanged: a queued report is in progress,
-// not failed, so Ready keeps reflecting the last settled state rather than flapping on
-// every report.
+// awaitPending marks both UpstreamReady and Ready as False/UpstreamReportPending for an
+// in-flight report job, persists the status when changed, and requeues after the poll
+// interval so the job is polled again. Ready is set False (not left unchanged) so a
+// policy whose report has not yet been confirmed reports Ready=False — visible in the
+// printed column — instead of a blank Ready before its first report settles. It is
+// restored to True by settleProtected once the job completes.
 func (r *EdgePolicyReconciler) awaitPending(ctx context.Context, policy *securityv1alpha1.EdgePolicy,
 	baseChanged bool) (ctrl.Result, error) {
-	changed := setUpstreamPendingCondition(policy)
-	if err := r.writeStatus(ctx, policy, changed || baseChanged); err != nil {
+	upstreamChanged := setUpstreamPendingCondition(policy)
+	readyChanged := setReadyCondition(policy, metav1.ConditionFalse, reasonUpstreamPending,
+		"Upstream report queued; awaiting completion")
+	if err := r.writeStatus(ctx, policy, upstreamChanged || readyChanged || baseChanged); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: r.pollInterval()}, nil

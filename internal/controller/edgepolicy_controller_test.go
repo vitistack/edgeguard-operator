@@ -1725,6 +1725,12 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(upstreamCond).NotTo(BeNil())
 			Expect(upstreamCond.Reason).To(Equal(reasonUpstreamPending))
 
+			By("reporting Ready=False while the first report is still being confirmed")
+			pendingReady := meta.FindStatusCondition(queued.Status.Conditions, conditionTypeReady)
+			Expect(pendingReady).NotTo(BeNil())
+			Expect(pendingReady.Status).To(Equal(metav1.ConditionFalse))
+			Expect(pendingReady.Reason).To(Equal(reasonUpstreamPending))
+
 			By("polling again while the job is still pending: no resubmit, requeue again")
 			result, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
 			Expect(err).NotTo(HaveOccurred())

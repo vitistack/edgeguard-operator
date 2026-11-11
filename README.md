@@ -141,6 +141,7 @@ The operator maintains three conditions on `.status.conditions`:
 | | `ServiceTerminating` | Target Service is being deleted. |
 | | `ServiceNotLoadBalancer` | Target Service is not of type `LoadBalancer`. |
 | | `UpstreamReportIncomplete` | A required report field (the IPAM credential and/or a load balancer address) is missing, so the report was not sent — not ready until it resolves. |
+| | `UpstreamReportPending` | With the status queue enabled, the report was accepted as a queued job and is still being polled for completion — not ready until it is confirmed. |
 | | `UpstreamReportFailed` | The last upstream report failed transiently (connectivity, or a 5xx); a retry is pending. |
 | | `UpstreamReportRejected` | The upstream refused the report with a 4xx; treated as terminal — not retried on the timer, and the identical payload is suppressed until the report content changes. |
 | **IpamSecretReady** | `SecretResolved` | Credential resolved successfully. |
