@@ -69,8 +69,10 @@ type PortReport struct {
 	// reporting is enabled plus the discovered and user-declared ports.
 	Filter FilterReport `json:"filter"`
 	// DDoS carries the DDoS geographic region policy derived from spec.ddos:
-	// whether it is enabled, the permitted region, and any additional allowed
-	// CIDRs. Omitted from the payload when the policy declares no spec.ddos block.
+	// whether it is enabled, the permitted region, and any additional allowed CIDRs.
+	// The controller always populates it — a policy with no spec.ddos block reports it
+	// disabled (enabled=false) rather than omitting the section, mirroring filter. It
+	// stays a pointer (with omitempty) so other callers may still omit it.
 	DDoS *DDoSReport `json:"ddos,omitempty"`
 }
 

@@ -335,6 +335,11 @@ var _ = Describe("EdgePolicy Controller", func() {
 			Expect(report.Filter.ObservedPorts).To(HaveLen(1))
 			Expect(report.Filter.ObservedPorts[0].Port).To(Equal(int32(443)))
 
+			By("confirming ddos defaults to a disabled section rather than being omitted")
+			Expect(report.DDoS).NotTo(BeNil())
+			Expect(report.DDoS.Enabled).To(BeFalse())
+			Expect(report.DDoS.AdditionalCidrList).NotTo(BeNil())
+
 			By("confirming the observed IPs were recorded on the policy status")
 			reconciled := &securityv1alpha1.EdgePolicy{}
 			Expect(k8sClient.Get(ctx, policyKey, reconciled)).To(Succeed())

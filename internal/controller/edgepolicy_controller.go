@@ -652,12 +652,14 @@ func filterEnabled(policy *securityv1alpha1.EdgePolicy) bool {
 }
 
 // ddosReport maps the policy's spec.ddos block into the upstream payload
-// representation, or nil when the policy declares no ddos block so the report omits
-// the ddos section entirely. The additionalCidrList is always a non-nil slice
-// (empty when none are declared) so it serializes as [] rather than null.
+// representation. When the policy declares no ddos block, a disabled report
+// (enabled=false) is returned rather than nil, so the upstream always sees the ddos
+// section with its flag defaulted to false instead of a missing section — mirroring how
+// the filter section is always present. The additionalCidrList is always a non-nil
+// slice (empty when none are declared) so it serializes as [] rather than null.
 func ddosReport(policy *securityv1alpha1.EdgePolicy) *upstream.DDoSReport {
 	if policy.Spec.DDoS == nil {
-		return nil
+		return &upstream.DDoSReport{Enabled: false, AdditionalCidrList: []string{}}
 	}
 	allow := make([]string, 0, len(policy.Spec.DDoS.AdditionalCidrList))
 	allow = append(allow, policy.Spec.DDoS.AdditionalCidrList...)
