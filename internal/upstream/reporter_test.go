@@ -17,6 +17,7 @@ limitations under the License.
 package upstream
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -90,6 +91,31 @@ func TestIdempotencyKeyChangesWithDedupeFields(t *testing.T) {
 				t.Fatalf("expected key to change when %s changes", name)
 			}
 		})
+	}
+}
+
+// TestPortReportAlwaysSerializesOptionalKeys verifies that the optional report fields
+// are always present in the serialized payload — the filter/ddos port and CIDR lists as
+// [] and the DDoS region as "" — so the upstream always sees the keys rather than a
+// missing field. The controller builds these as non-nil empty slices; this pins the
+// serialization shape (no omitempty dropping the keys).
+func TestPortReportAlwaysSerializesOptionalKeys(t *testing.T) {
+	report := PortReport{
+		ServiceName:   "my-service",
+		IPv4Addresses: []string{},
+		IPv6Addresses: []string{},
+		Filter:        FilterReport{ObservedPorts: []Port{}, AdditionalPorts: []Port{}},
+		DDoS:          &DDoSReport{AdditionalCidrList: []string{}},
+	}
+	b, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshaling report: %v", err)
+	}
+	body := string(b)
+	for _, want := range []string{`"additionalPorts":[]`, `"region":""`, `"additionalCidrList":[]`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected %s in the serialized payload, got: %s", want, body)
+		}
 	}
 }
 
