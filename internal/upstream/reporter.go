@@ -97,9 +97,9 @@ type DDoSReport struct {
 	// Enabled reflects spec.ddos.enabled, i.e. whether the policy opts into the
 	// DDoS geographic region policy.
 	Enabled bool `json:"enabled"`
-	// Region is the permitted geographic region from spec.ddos.region. Always
-	// serialized (as "" when unset) so the key is always present in the payload.
-	Region string `json:"region"`
+	// Region is the permitted geographic region from spec.ddos.region. Omitted from
+	// the payload when unset (unlike the always-present port/CIDR lists).
+	Region string `json:"region,omitempty"`
 	// AdditionalCidrList is the set of extra allowed CIDRs from
 	// spec.ddos.additionalCidrList. Always serialized (as [] when none are
 	// declared) so the shape is stable.

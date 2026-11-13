@@ -94,12 +94,11 @@ func TestIdempotencyKeyChangesWithDedupeFields(t *testing.T) {
 	}
 }
 
-// TestPortReportAlwaysSerializesOptionalKeys verifies that the optional report fields
-// are always present in the serialized payload — the filter/ddos port and CIDR lists as
-// [] and the DDoS region as "" — so the upstream always sees the keys rather than a
-// missing field. The controller builds these as non-nil empty slices; this pins the
-// serialization shape (no omitempty dropping the keys).
-func TestPortReportAlwaysSerializesOptionalKeys(t *testing.T) {
+// TestPortReportSerializationShape verifies the serialized payload shape: the filter and
+// ddos port/CIDR lists are always present (as [] when empty) so the upstream always sees
+// them, while ddos.region is omitted when unset and included when set.
+func TestPortReportSerializationShape(t *testing.T) {
+	// Empty optional fields: the lists are present as [], and the region key is absent.
 	report := PortReport{
 		ServiceName:   "my-service",
 		IPv4Addresses: []string{},
@@ -112,10 +111,23 @@ func TestPortReportAlwaysSerializesOptionalKeys(t *testing.T) {
 		t.Fatalf("marshaling report: %v", err)
 	}
 	body := string(b)
-	for _, want := range []string{`"additionalPorts":[]`, `"region":""`, `"additionalCidrList":[]`} {
+	for _, want := range []string{`"additionalPorts":[]`, `"additionalCidrList":[]`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected %s in the serialized payload, got: %s", want, body)
 		}
+	}
+	if strings.Contains(body, `"region"`) {
+		t.Fatalf("expected the region key to be omitted when unset, got: %s", body)
+	}
+
+	// Region set: the key appears with its value.
+	report.DDoS = &DDoSReport{Region: "norway", AdditionalCidrList: []string{}}
+	b, err = json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshaling report: %v", err)
+	}
+	if body = string(b); !strings.Contains(body, `"region":"norway"`) {
+		t.Fatalf("expected region to be serialized when set, got: %s", body)
 	}
 }
 
