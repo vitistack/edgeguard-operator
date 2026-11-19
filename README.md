@@ -379,6 +379,39 @@ Notable values (see `chart/edgeguard-operator/values.yaml`):
   You create the ConfigMap (with key/file `caBundle.fileName`, default `nhn-certbundle.crt`) in the release namespace; the chart mounts it at `caBundle.mountPath` (default `/etc/ssl/certs/nhn-certbundle.crt`).
 - **`crd.enabled` / `crd.keep`** — install the `EdgePolicy` CRD with the chart and keep it on uninstall.
 
+**Argo CD:**
+
+The chart is also published as an OCI artifact and can be deployed with an Argo CD `Application`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: edgeguard-operator
+  namespace: argocd
+spec:
+  destination:
+    namespace: edgeguard-operator
+    server: https://kubernetes.default.svc
+  project: default
+  source:
+    helm:
+      parameters:
+      - name: manager.caBundle.enabled
+        value: "true"
+      valueFiles:
+      - values.yaml
+    path: .
+    repoURL: oci://ncr.sky.nhn.no/ghcr/vitistack/helm/edgeguard-operator
+    targetRevision: 1.*
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+```
+
 Run `make help` for the full list of targets. More context is in the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html).
 
 ---
