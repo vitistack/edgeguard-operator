@@ -117,12 +117,14 @@ type DDoSSpec struct {
 	Region string `json:"region,omitempty"`
 
 	// Additional IPv4 or IPv6 CIDR ranges allowed regardless of geographic region.
+	// IPv4 ranges may be at most /24 and IPv6 ranges at most /56.
 	// +optional
 	// +listType=set
 	// +kubebuilder:validation:MaxItems=256
 	// +kubebuilder:validation:items:Type=string
 	// +kubebuilder:validation:items:MaxLength=43
 	// +kubebuilder:validation:XValidation:rule="self.all(cidr, isCIDR(cidr))",message="Each entry must be a valid IPv4 or IPv6 CIDR"
+	// +kubebuilder:validation:XValidation:rule="self.all(c, !isCIDR(c) || cidr(c).prefixLength() >= (cidr(c).ip().family() == 4 ? 24 : 56))",message="IPv4 CIDRs must be /24 or narrower and IPv6 CIDRs must be /56 or narrower"
 	AdditionalCidrList []string `json:"additionalCidrList,omitempty"`
 }
 

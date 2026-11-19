@@ -69,7 +69,7 @@ flowchart LR
 | `datacenter` | enum | ✅ | Availability zone the policy belongs to, reported upstream. One of `no-east-az1`, `no-east-az2`, `no-central-az1`, `no-central-az2`, `no-west-az1`, `no-west-az2`, `no-north-az1`, `no-north-az2`. |
 | `ddos.enabled` | bool | ⬜ | Whether the DDoS geographic region policy is on. Reflected in the upstream report's `ddos.enabled`. Defaults to `false` when omitted. |
 | `ddos.region` | enum | ⬜ | One of `norway`, `nordic`, `europe`. |
-| `ddos.additionalCidrList` | []CIDR | ⬜ | Extra IPv4/IPv6 CIDRs allowed regardless of region (max 256). |
+| `ddos.additionalCidrList` | []CIDR | ⬜ | Extra IPv4/IPv6 CIDRs allowed regardless of region (max 256). Each entry must be a valid CIDR no wider than `/24` for IPv4 or `/56` for IPv6 (e.g. `192.0.2.0/23` or `2001:db8::/48` is rejected). |
 
 **`AdditionalPort`** (each entry in `filter.additionalPortList`):
 
@@ -109,7 +109,7 @@ spec:
     region: norway
     additionalCidrList:
       - 192.0.2.0/24
-      - 2001:db8::/48
+      - 2001:db8::/56
 ```
 
 ### Target Service annotations
@@ -218,7 +218,7 @@ Idempotency-Key: <sha256 hash>
   "ddos": {
     "enabled": true,
     "region": "norway",
-    "additionalCidrList": ["192.0.2.0/24", "2001:db8::/48"]
+    "additionalCidrList": ["192.0.2.0/24", "2001:db8::/56"]
   }
 }
 ```

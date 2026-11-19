@@ -131,6 +131,45 @@ var _ = Describe("EdgePolicy Controller", func() {
 		})
 	})
 
+	Context("When validating ddos.additionalCidrList", func() {
+		ctx := context.Background()
+
+		DescribeTable("enforces valid CIDRs no wider than IPv4 /24 and IPv6 /56",
+			func(cidr string, valid bool) {
+				policy := &securityv1alpha1.EdgePolicy{
+					Name:      "cidr-validation",
+					Namespace: metav1.NamespaceDefault,
+					Spec: securityv1alpha1.EdgePolicySpec{
+						Datacenter: dcEast,
+						TargetRef: securityv1alpha1.TargetReference{
+							APIVersion: "v1",
+							Kind:       kindService,
+							Name:       "test-service",
+						},
+						DDoS: &securityv1alpha1.DDoSSpec{
+							AdditionalCidrList: []string{cidr},
+						},
+					},
+				}
+				err := k8sClient.Create(ctx, policy, client.DryRunAll)
+				if valid {
+					Expect(err).NotTo(HaveOccurred())
+				} else {
+					Expect(errors.IsInvalid(err)).To(BeTrue(), "expected Invalid error, got %v", err)
+				}
+			},
+			Entry("IPv4 /24", "192.0.2.0/24", true),
+			Entry("IPv4 /32", "192.0.2.10/32", true),
+			Entry("IPv4 /23", "192.0.2.0/23", false),
+			Entry("IPv4 /0", "0.0.0.0/0", false),
+			Entry("IPv6 /56", "2001:db8:1234::/56", true),
+			Entry("IPv6 /128", "2001:db8::1/128", true),
+			Entry("IPv6 /48", "2001:db8:1234::/48", false),
+			Entry("IPv6 /0", "::/0", false),
+			Entry("not a CIDR", "not-a-cidr", false),
+		)
+	})
+
 	Context("When the target Service is created after the EdgePolicy", func() {
 		const (
 			policyName  = "late-service-policy"

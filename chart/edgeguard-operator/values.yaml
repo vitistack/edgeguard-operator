@@ -126,11 +126,11 @@ manager:
   ##
   resources:
     limits:
-      cpu: 500m
-      memory: 128Mi
+      cpu: 50m
+      memory: 60Mi
     requests:
       cpu: 10m
-      memory: 64Mi
+      memory: 30Mi
 
   ## Manager pod's affinity
   ##

@@ -87,8 +87,9 @@ spec:
                   allowed IP ranges.
                 properties:
                   additionalCidrList:
-                    description: Additional IPv4 or IPv6 CIDR ranges allowed regardless
-                      of geographic region.
+                    description: |-
+                      Additional IPv4 or IPv6 CIDR ranges allowed regardless of geographic region.
+                      IPv4 ranges may be at most /24 and IPv6 ranges at most /56.
                     items:
                       maxLength: 43
                       type: string
@@ -98,6 +99,10 @@ spec:
                     x-kubernetes-validations:
                     - message: Each entry must be a valid IPv4 or IPv6 CIDR
                       rule: self.all(cidr, isCIDR(cidr))
+                    - message: IPv4 CIDRs must be /24 or narrower and IPv6 CIDRs must
+                        be /56 or narrower
+                      rule: 'self.all(c, !isCIDR(c) || cidr(c).prefixLength() >= (cidr(c).ip().family()
+                        == 4 ? 24 : 56))'
                   enabled:
                     default: false
                     description: |-
